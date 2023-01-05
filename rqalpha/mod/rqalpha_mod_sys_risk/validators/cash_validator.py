@@ -1,79 +1,53 @@
 # -*- coding: utf-8 -*-
+# 版权所有 2019 深圳米筐科技有限公司（下称“米筐科技”）
 #
-# Copyright 2017 Ricequant, Inc
+# 除非遵守当前许可，否则不得使用本软件。
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+#     * 非商业用途（非商业用途指个人出于非商业目的使用本软件，或者高校、研究所等非营利机构出于教育、科研等目的使用本软件）：
+#         遵守 Apache License 2.0（下称“Apache 2.0 许可”），
+#         您可以在以下位置获得 Apache 2.0 许可的副本：http://www.apache.org/licenses/LICENSE-2.0。
+#         除非法律有要求或以书面形式达成协议，否则本软件分发时需保持当前许可“原样”不变，且不得附加任何条件。
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+#     * 商业用途（商业用途指个人出于任何商业目的使用本软件，或者法人或其他组织出于任何目的使用本软件）：
+#         未经米筐科技授权，任何个人不得出于任何商业目的使用本软件（包括但不限于向第三方提供、销售、出租、出借、转让本软件、
+#         本软件的衍生产品、引用或借鉴了本软件功能或源代码的产品或服务），任何法人或其他组织不得出于任何目的使用本软件，
+#         否则米筐科技有权追究相应的知识产权侵权责任。
+#         在此前提下，对本软件的使用同样需要遵守 Apache 2.0 许可，Apache 2.0 许可与本许可冲突之处，以本许可为准。
+#         详细的授权流程，请联系 public@ricequant.com 获取。
 
 from rqalpha.interface import AbstractFrontendValidator
-from rqalpha.const import SIDE, POSITION_EFFECT, DEFAULT_ACCOUNT_TYPE
+from rqalpha.const import POSITION_EFFECT
+from rqalpha.utils.logger import user_system_log
 
 from rqalpha.utils.i18n import gettext as _
+
+
+def is_cash_enough(env, order, cash, warn=False):
+    instrument = env.data_proxy.instrument(order.order_book_id)
+    cost_money = instrument.calc_cash_occupation(order.frozen_price, order.quantity, order.position_direction)
+    cost_money += env.get_order_transaction_cost(order)
+    if cost_money <= cash:
+        return True
+    if warn:
+        user_system_log.warn(
+            _("Order Creation Failed: not enough money to buy {order_book_id}, needs {cost_money:.2f},"
+              " cash {cash:.2f}").format(
+                order_book_id=order.order_book_id,
+                cost_money=cost_money,
+                cash=cash,
+            )
+        )
+    return False
 
 
 class CashValidator(AbstractFrontendValidator):
     def __init__(self, env):
         self._env = env
 
-    def _stock_validator(self, account, order):
-        if order.side == SIDE.SELL:
+    def can_submit_order(self, order, account=None):
+        if (account is None) or (order.position_effect != POSITION_EFFECT.OPEN):
             return True
-        # 检查可用资金是否充足
-        # 保证占用资金包含了佣金部分, 在这里假定最小手续费就是5块, 佣金费率为万8。
-        # 没有区分不同柜台标准, 也没有根据回测中 mod_config 设置的佣金倍率进行改动, dirty hack
-        frozen_value = order.frozen_price * order.quantity
-        cost_money = frozen_value * 1.0008 if frozen_value * 0.0008 > 5 else frozen_value + 5
-        if cost_money <= account.cash:
-            return True
+        return is_cash_enough(self._env, order, account.cash, warn=True)
 
-        order.mark_rejected(
-            _("Order Rejected: not enough money to buy {order_book_id}, needs {cost_money:.2f}, "
-              "cash {cash:.2f}").format(
-                order_book_id=order.order_book_id,
-                cost_money=cost_money,
-                cash=account.cash,
-            )
-        )
-        return False
-
-    def _future_validator(self, account, order):
-        if order.position_effect != POSITION_EFFECT.OPEN:
-            return True
-
-        instrument = self._env.get_instrument(order.order_book_id)
-        margin_info = self._env.data_proxy.get_margin_info(order.order_book_id)
-        margin_rate = margin_info['long_margin_ratio' if order.side == 'BUY' else 'short_margin_ratio']
-        margin = order.frozen_price * order.quantity * instrument.contract_multiplier * margin_rate
-        cost_money = margin * self._env.config.base.margin_multiplier
-        if cost_money <= account.cash:
-            return True
-
-        order.mark_rejected(
-            _("Order Rejected: not enough money to buy {order_book_id}, needs {cost_money:.2f},"
-              " cash {cash:.2f}").format(
-                order_book_id=order.order_book_id,
-                cost_money=cost_money,
-                cash=account.cash,
-            )
-        )
-        return False
-
-    def can_submit_order(self, account, order):
-        if account.type == DEFAULT_ACCOUNT_TYPE.STOCK.name:
-            return self._stock_validator(account, order)
-        elif account.type == DEFAULT_ACCOUNT_TYPE.FUTURE.name:
-            return self._future_validator(account, order)
-        else:
-            raise NotImplementedError
-
-    def can_cancel_order(self, account, order):
+    def can_cancel_order(self, order, account=None):
         return True
