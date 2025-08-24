@@ -14,21 +14,21 @@
 #         否则米筐科技有权追究相应的知识产权侵权责任。
 #         在此前提下，对本软件的使用同样需要遵守 Apache 2.0 许可，Apache 2.0 许可与本许可冲突之处，以本许可为准。
 #         详细的授权流程，请联系 public@ricequant.com 获取。
-
+from collections import deque
 from datetime import date
 
 from decimal import Decimal
 
-from rqalpha.utils.functools import lru_cache
 from rqalpha.model.trade import Trade
 from rqalpha.const import POSITION_DIRECTION, SIDE, POSITION_EFFECT, DEFAULT_ACCOUNT_TYPE, INSTRUMENT_TYPE
 from rqalpha.environment import Environment
 from rqalpha.portfolio.position import Position, PositionProxy
 from rqalpha.data.data_proxy import DataProxy
-from rqalpha.utils import INST_TYPE_IN_STOCK_ACCOUNT
+from rqalpha.utils import INST_TYPE_IN_STOCK_ACCOUNT, is_valid_price
 from rqalpha.utils.logger import user_system_log
 from rqalpha.utils.class_helper import deprecated_property, cached_property
 from rqalpha.utils.i18n import gettext as _
+from rqalpha.core.events import EVENT, Event
 
 
 def _int_to_date(d):
@@ -150,6 +150,7 @@ class StockPosition(Position):
             if self.cash_return_by_stock_delisted:
                 delta_cash = self.market_value
             self._quantity = self._old_quantity = 0
+            self._queue.clear()
         return delta_cash
 
     @cached_property
@@ -191,9 +192,13 @@ class StockPosition(Position):
             round_lot = self._instrument.round_lot
             amount = int(Decimal(amount) / Decimal(round_lot)) * round_lot
             if amount > 0:
-                self.apply_trade(Trade.__from_create__(
+                account = self._env.get_account(self._order_book_id)
+                trade = Trade.__from_create__(
                     None, last_price, amount, SIDE.BUY, POSITION_EFFECT.OPEN, self._order_book_id
-                ))
+                )
+                trade._commission = self._env.get_trade_commission(trade)
+                trade._tax = self._env.get_trade_tax(trade)
+                self._env.event_bus.publish_event(Event(EVENT.TRADE, account=account, trade=trade, order=None))
             return dividend_value - amount * last_price
         else:
             return dividend_value
@@ -206,9 +211,9 @@ class StockPosition(Position):
         self._last_price /= ratio
         ratio = Decimal(ratio)
         # int(6000 * 1.15) -> 6899
-        self._old_quantity = self._quantity = int(Decimal(self._quantity) * ratio)
-        self._logical_old_quantity = int(Decimal(self._logical_old_quantity) * ratio)
-
+        self._old_quantity = self._quantity = round(Decimal(self._quantity) * ratio)
+        self._logical_old_quantity = round(Decimal(self._logical_old_quantity) * ratio)
+        self._queue.handle_split(ratio, self._quantity)
 
 class FuturePosition(Position):
     __repr_properties__ = (
@@ -223,10 +228,15 @@ class FuturePosition(Position):
     @cached_property
     def contract_multiplier(self):
         return self._instrument.contract_multiplier
-
-    @cached_property
+    
+    @property
     def margin_rate(self):
-        return self._instrument.margin_rate * self._env.config.base.margin_multiplier
+        # type: () -> float
+        if self.direction == POSITION_DIRECTION.LONG:
+            margin_ratio = self._instrument.get_long_margin_ratio(self._env.trading_dt.date())
+        elif self.direction == POSITION_DIRECTION.SHORT:
+            margin_ratio = self._instrument.get_short_margin_ratio(self._env.trading_dt.date())
+        return margin_ratio * self._env.config.base.margin_multiplier
 
     @property
     def equity(self):
@@ -235,9 +245,9 @@ class FuturePosition(Position):
         return self._quantity * (self.last_price - self._avg_price) * self.contract_multiplier * self._direction_factor
 
     @property
-    def margin(self) -> float:
+    def margin(self):
+        # rtpe: () -> float
         """
-        保证金
         保证金 = 持仓量 * 最新价 * 合约乘数 * 保证金率
         """
         return self.margin_rate * self.market_value
@@ -262,15 +272,18 @@ class FuturePosition(Position):
         # type: () -> float
         return super(FuturePosition, self).pnl * self.contract_multiplier
 
-    def calc_close_today_amount(self, trade_amount):
-        close_today_amount = trade_amount - self.old_quantity
-        return max(close_today_amount, 0)
+    def calc_close_today_amount(self, trade_amount, position_effect):
+        if position_effect == POSITION_EFFECT.CLOSE_TODAY:
+            return trade_amount if trade_amount <= self.today_quantity else self.today_quantity
+        else:
+            return max(trade_amount - self._old_quantity, 0)
 
     def apply_trade(self, trade):
         if trade.position_effect == POSITION_EFFECT.CLOSE_TODAY:
             self._transaction_cost += trade.transaction_cost
             self._quantity -= trade.last_quantity
             self._trade_cost -= trade.last_price * trade.last_quantity
+            self._queue.handle_trade(-trade.last_quantity, self._env.trading_dt.date(), close_today=True)
         else:
             super(FuturePosition, self).apply_trade(trade)
 
@@ -281,22 +294,47 @@ class FuturePosition(Position):
                     trade.last_price - self._avg_price
             ) * trade.last_quantity * self.contract_multiplier * self._direction_factor
 
+    @property
+    def prev_close(self):
+        if not is_valid_price(self._prev_close):
+            if self._env.config.mod.sys_accounts.futures_settlement_price_type == "settlement":
+                self._prev_close = self._env.data_proxy.get_prev_settlement(self._order_book_id, self._env.trading_dt)
+            else:
+                self._prev_close = super().prev_close
+        return self._prev_close
+
     def settlement(self, trading_date):
         # type: (date) -> float
-        super(FuturePosition, self).settlement(trading_date)
+        delta_cash = super(FuturePosition, self).settlement(trading_date)
         if self._quantity == 0:
-            return 0
+            return delta_cash
         data_proxy = self._env.data_proxy
         instrument = data_proxy.instrument(self._order_book_id)
         next_date = data_proxy.get_next_trading_date(trading_date)
-        delta_cash = self.equity
+        if self._env.config.mod.sys_accounts.futures_settlement_price_type == "settlement":
+            # 逐日盯市按照结算价结算
+            self._last_price = self._env.data_proxy.get_settle_price(self._order_book_id, self._env.trading_dt)
+        delta_cash += self.equity
+        self._avg_price = self.last_price
         if instrument.de_listed_at(next_date):
             user_system_log.warn(_(u"{order_book_id} is expired, close all positions by system").format(
                 order_book_id=self._order_book_id
             ))
+            account = self._env.get_account(self._order_book_id)
+            side = SIDE.SELL if self.direction == POSITION_DIRECTION.LONG else SIDE.BUY
+            trade = Trade.__from_create__(
+                None, self.last_price, self._quantity, side, POSITION_EFFECT.CLOSE, self._order_book_id
+            )
+            self._env.event_bus.publish_event(Event(EVENT.TRADE, account=account, trade=trade, order=None))
             self._quantity = self._old_quantity = 0
-        self._avg_price = self.last_price
+            self._queue.clear()
         return delta_cash
+    
+    def post_settlement(self):
+        try:
+            del self.__dict__["margin_ratio"]
+        except KeyError:
+            pass
 
 
 class StockPositionProxy(PositionProxy):

@@ -16,17 +16,33 @@
 #         详细的授权流程，请联系 public@ricequant.com 获取。
 import datetime
 from collections import defaultdict
+import math
 from rqalpha.const import MATCHING_TYPE, ORDER_TYPE, POSITION_EFFECT, SIDE
 from rqalpha.environment import Environment
 from rqalpha.core.events import EVENT, Event
-from rqalpha.model.order import Order
+from rqalpha.model.order import Order, ALGO_ORDER_STYLES
 from rqalpha.model.trade import Trade
 from rqalpha.model.tick import TickObject
 from rqalpha.portfolio.account import Account
 from rqalpha.utils import is_valid_price
+from rqalpha.interface import AbstractPriceBoard
 from typing import Dict
 from rqalpha.utils.i18n import gettext as _
 from .slippage import SlippageDecider
+
+
+LIMIT_PRICE_VALID_THRESHOLD = 1e-7
+
+
+def _price_reaches_limit(order_book_id: str, side: SIDE, deal_price: float, price_board: AbstractPriceBoard):
+    if side == SIDE.BUY:
+        limit_price = price_board.get_limit_up(order_book_id)
+        return deal_price >= limit_price or math.isclose(deal_price, limit_price, abs_tol=LIMIT_PRICE_VALID_THRESHOLD)
+    elif side == SIDE.SELL:
+        limit_price = price_board.get_limit_down(order_book_id)
+        return deal_price <= limit_price or math.isclose(deal_price, limit_price, abs_tol=LIMIT_PRICE_VALID_THRESHOLD)
+    else:
+        raise ValueError(f"Unsupport side: {side}")
 
 
 class AbstractMatcher:
@@ -34,7 +50,7 @@ class AbstractMatcher:
         # type: (Account, Order, bool) -> None
         raise NotImplementedError
 
-    def update(self):
+    def update(self, event):
         raise NotImplementedError
 
 
@@ -78,10 +94,30 @@ class DefaultBarMatcher(AbstractMatcher):
             return 0
 
     def _open_auction_deal_price_decider(self, order_book_id, _):
-        return self._env.data_proxy.get_open_auction_bar(order_book_id, self._env.calendar_dt).open
+        return self._env.data_proxy.get_open_auction_bar(order_book_id, self._env.trading_dt).open
 
     SUPPORT_POSITION_EFFECTS = (POSITION_EFFECT.OPEN, POSITION_EFFECT.CLOSE, POSITION_EFFECT.CLOSE_TODAY)
     SUPPORT_SIDES = (SIDE.BUY, SIDE.SELL)
+
+    def _get_bar_volume(self, order, open_auction=False):
+        if open_auction:
+            volume = self._env.data_proxy.get_open_auction_volume(order.order_book_id, self._env.trading_dt)
+        else:
+            if isinstance(order.style, ALGO_ORDER_STYLES):
+                _, volume = self._env.data_proxy.get_algo_bar(order.order_book_id, order.style, self._env.calendar_dt)
+            else:
+                volume = self._env.get_bar(order.order_book_id).volume
+        return volume
+
+    def _get_deal_price(self, order, open_auction=False):
+        if open_auction:
+            deal_price = self._open_auction_deal_price_decider(order.order_book_id, order.side)
+        else:
+            if isinstance(order.style, ALGO_ORDER_STYLES):
+                deal_price, v = self._env.data_proxy.get_algo_bar(order.order_book_id, order.style, self._env.calendar_dt)
+            else:
+                deal_price = self._deal_price_decider(order.order_book_id, order.side)
+        return deal_price
 
     def match(self, account, order, open_auction):
         # type: (Account, Order, bool) -> None
@@ -90,10 +126,7 @@ class DefaultBarMatcher(AbstractMatcher):
         order_book_id = order.order_book_id
         instrument = self._env.get_instrument(order_book_id)
 
-        if open_auction:
-            deal_price = self._open_auction_deal_price_decider(order_book_id, order.side)
-        else:
-            deal_price = self._deal_price_decider(order_book_id, order.side)
+        deal_price = self._get_deal_price(order, open_auction)
 
         if not is_valid_price(deal_price):
             listed_date = instrument.listed_date.date()
@@ -104,12 +137,15 @@ class DefaultBarMatcher(AbstractMatcher):
                     order_book_id=order.order_book_id,
                     listed_date=listed_date,
                 )
+            elif isinstance(order.style, ALGO_ORDER_STYLES):
+                reason = _(u"Order Cancelled: {order_book_id} miss market data or bar no volume.").format(order_book_id=order.order_book_id)
             else:
-                reason = _(u"Order Cancelled: current bar [{order_book_id}] miss market data.").format(
-                    order_book_id=order.order_book_id)
-            order.mark_rejected(reason)
+                # 撮合的时候无行情数据也不需要撤单，等到有行情再撮合
+                reason = None
+            if reason:
+                order.mark_rejected(reason)
             return
-
+        
         price_board = self._env.price_board
         if order.type == ORDER_TYPE.LIMIT:
             if order.side == SIDE.BUY and order.price < deal_price:
@@ -118,37 +154,26 @@ class DefaultBarMatcher(AbstractMatcher):
                 return
             # 是否限制涨跌停不成交
             if self._price_limit:
-                if order.side == SIDE.BUY and deal_price >= price_board.get_limit_up(order_book_id):
-                    return
-                if order.side == SIDE.SELL and deal_price <= price_board.get_limit_down(order_book_id):
+                if _price_reaches_limit(order_book_id, order.side, deal_price, price_board):
                     return
         else:
             if self._price_limit:
-                if order.side == SIDE.BUY and deal_price >= price_board.get_limit_up(order_book_id):
+                if _price_reaches_limit(order_book_id, order.side, deal_price, price_board):
                     reason = _(
-                        "Order Cancelled: current bar [{order_book_id}] reach the limit_up price."
-                    ).format(order_book_id=order.order_book_id)
-                    order.mark_rejected(reason)
-                    return
-                if order.side == SIDE.SELL and deal_price <= price_board.get_limit_down(order_book_id):
-                    reason = _(
-                        "Order Cancelled: current bar [{order_book_id}] reach the limit_down price."
-                    ).format(order_book_id=order.order_book_id)
+                        "Order Cancelled: current bar [{order_book_id}] reach the {limit_up_or_down} price."
+                    ).format(order_book_id=order.order_book_id, limit_up_or_down="limit_up" if order.side == SIDE.BUY else "limit_down")
                     order.mark_rejected(reason)
                     return
 
         if self._inactive_limit:
-            bar_volume = self._env.get_bar(order_book_id).volume
+            bar_volume = self._get_bar_volume(order, open_auction=open_auction)
             if bar_volume == 0:
                 reason = _(u"Order Cancelled: {order_book_id} bar no volume").format(order_book_id=order.order_book_id)
                 order.mark_cancelled(reason)
                 return
 
         if self._volume_limit:
-            if open_auction:
-                volume = self._env.data_proxy.get_open_auction_bar(order_book_id, self._env.calendar_dt).volume
-            else:
-                volume = self._env.get_bar(order_book_id).volume
+            volume = self._get_bar_volume(order, open_auction=open_auction)
             if volume == volume:
                 volume_limit = round(volume * self._volume_percent) - self._turnover[order.order_book_id]
 
@@ -170,7 +195,8 @@ class DefaultBarMatcher(AbstractMatcher):
         else:
             fill = order.unfilled_quantity
 
-        ct_amount = account.calc_close_today_amount(order_book_id, fill, order.position_direction)
+        ct_amount = account.calc_close_today_amount(order_book_id, fill, order.position_direction, order.position_effect)
+
         if open_auction:
             price = deal_price
         else:
@@ -188,6 +214,18 @@ class DefaultBarMatcher(AbstractMatcher):
         )
         trade._commission = self._env.get_trade_commission(trade)
         trade._tax = self._env.get_trade_tax(trade)
+
+        if order.position_effect == POSITION_EFFECT.OPEN and self._slippage_decider.decider.rate != 0:
+            # 标的价格经过滑点处理后，账户资金可能不够买入，需要进行验证
+            cost_money = instrument.calc_cash_occupation(price, order.quantity, order.position_direction, order.trading_datetime.date())
+            cost_money += trade.transaction_cost
+            if cost_money > account.cash + order.init_frozen_cash:
+                reason = _(u"Order Cancelled: not enough money to buy {order_book_id}, needs {cost_money:.2f}, cash {cash:.2f}").format(
+                        order_book_id=order_book_id, cost_money=cost_money, cash = account.cash + order.init_frozen_cash
+                        )
+                order.mark_rejected(reason)
+                return
+
         order.fill(trade)
         self._turnover[order.order_book_id] += fill
 
@@ -205,7 +243,7 @@ class DefaultBarMatcher(AbstractMatcher):
             )
             order.mark_cancelled(reason)
 
-    def update(self):
+    def update(self, event):
         self._turnover.clear()
 
 
@@ -231,7 +269,6 @@ class DefaultTickMatcher(AbstractMatcher):
         self._cur_tick: Dict[str, TickObject] = dict()
 
         # 订阅一些事件
-        self._env.event_bus.prepend_listener(EVENT.TICK, self._on_tick)
         self._env.event_bus.add_listener(EVENT.BEFORE_TRADING, self._on_before_trading)
 
     def _create_deal_price_decider(self, matching_type):
@@ -259,12 +296,6 @@ class DefaultTickMatcher(AbstractMatcher):
         # 在每个交易日的盘前删除前一个交易日的数据
         self._last_tick.clear()
         self._cur_tick.clear()
-
-    def _on_tick(self, event):
-        # 保存上一个时刻的tick
-        self._last_tick[event.tick.order_book_id] = self._cur_tick.get(event.tick.order_book_id)
-        # 保存当前时刻的tick
-        self._cur_tick[event.tick.order_book_id] = event.tick
 
     def _get_today_history_ticks(self, order_book_id, count):
         """ 获取当前交易日的历史tick数据 """
@@ -331,6 +362,12 @@ class DefaultTickMatcher(AbstractMatcher):
                     order_book_id=order.order_book_id)
             order.mark_rejected(reason)
             return
+        
+        # 对价格进行滑点处理
+        if instrument.during_call_auction(self._env.calendar_dt):
+            price = deal_price
+        else:
+            price = self._slippage_decider.get_trade_price(order, deal_price)
 
         price_board = self._env.price_board
         if order.type == ORDER_TYPE.LIMIT:
@@ -340,9 +377,7 @@ class DefaultTickMatcher(AbstractMatcher):
                 return
             # 是否限制涨跌停不成交
             if self._price_limit:
-                if order.side == SIDE.BUY and deal_price >= price_board.get_limit_up(order_book_id):
-                    return
-                if order.side == SIDE.SELL and deal_price <= price_board.get_limit_down(order_book_id):
+                if _price_reaches_limit(order_book_id, order.side, deal_price, price_board):
                     return
             if self._liquidity_limit:
                 if order.side == SIDE.BUY and price_board.get_a1(order_book_id) == 0:
@@ -351,16 +386,10 @@ class DefaultTickMatcher(AbstractMatcher):
                     return
         else:
             if self._price_limit:
-                if order.side == SIDE.BUY and deal_price >= price_board.get_limit_up(order_book_id):
+                if _price_reaches_limit(order_book_id, order.side, deal_price, price_board):
                     reason = _(
-                        "Order Cancelled: current tick [{order_book_id}] reach the limit_up price."
-                    ).format(order_book_id=order.order_book_id)
-                    order.mark_rejected(reason)
-                    return
-                if order.side == SIDE.SELL and deal_price <= price_board.get_limit_down(order_book_id):
-                    reason = _(
-                        "Order Cancelled: current tick [{order_book_id}] reach the limit_down price."
-                    ).format(order_book_id=order.order_book_id)
+                        "Order Cancelled: current tick [{order_book_id}] reach the {limit_up_or_down} price."
+                    ).format(order_book_id=order.order_book_id, limit_up_or_down="limit_up" if order.side == SIDE.BUY else "limit_down")
                     order.mark_rejected(reason)
                     return
             if self._liquidity_limit:
@@ -419,13 +448,7 @@ class DefaultTickMatcher(AbstractMatcher):
             fill = order.unfilled_quantity
 
         # 平今的数量
-        ct_amount = account.calc_close_today_amount(order_book_id, fill, order.position_direction)
-
-        # 对价格进行滑点处理
-        if instrument.during_call_auction(self._env.calendar_dt):
-            price = deal_price
-        else:
-            price = self._slippage_decider.get_trade_price(order, deal_price)
+        ct_amount = account.calc_close_today_amount(order_book_id, fill, order.position_direction, order.position_effect)
 
         # 成交记录
         trade = Trade.__from_create__(
@@ -440,6 +463,17 @@ class DefaultTickMatcher(AbstractMatcher):
         )
         trade._commission = self._env.get_trade_commission(trade)
         trade._tax = self._env.get_trade_tax(trade)
+
+        if order.position_effect == POSITION_EFFECT.OPEN and self._slippage_decider.decider.rate != 0:
+            cost_money = instrument.calc_cash_occupation(price, order.quantity, order.position_direction, order.trading_datetime.date())
+            cost_money += trade.transaction_cost
+            if cost_money > account.cash + order.init_frozen_cash:
+                reason = _(u"Order Cancelled: not enough money to buy {order_book_id}, needs {cost_money:.2f}, cash {cash:.2f}").format(
+                        order_book_id=order_book_id, cost_money=cost_money, cash=account.cash + order.init_frozen_cash
+                    )
+                order.mark_rejected(reason)
+                return
+
         order.fill(trade)
         self._turnover[order.order_book_id] += fill
 
@@ -457,7 +491,9 @@ class DefaultTickMatcher(AbstractMatcher):
             )
             order.mark_cancelled(reason)
 
-    def update(self):
+    def update(self, event):
+        self._last_tick[event.tick.order_book_id] = self._cur_tick.get(event.tick.order_book_id)
+        self._cur_tick[event.tick.order_book_id] = event.tick
         self._turnover.clear()
 
 
@@ -567,7 +603,7 @@ class CounterPartyOfferMatcher(DefaultTickMatcher):
         else:
             fill = min(order.unfilled_quantity, amount)
 
-        ct_amount = account.calc_close_today_amount(order_book_id, fill, order.position_direction)
+        ct_amount = account.calc_close_today_amount(order_book_id, fill, order.position_direction, order.position_effect)
 
         trade = Trade.__from_create__(
             order_id=order.order_id,

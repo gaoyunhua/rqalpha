@@ -94,6 +94,12 @@ class MATCHING_TYPE(CustomEnum):
 class ORDER_TYPE(CustomEnum):
     MARKET = "MARKET"
     LIMIT = "LIMIT"
+    ALGO = "ALGO"
+
+
+class ALGO(CustomEnum):
+    TWAP = "TWAP"
+    VWAP = "VWAP"
 
 
 # noinspection PyPep8Naming
@@ -151,6 +157,7 @@ class INSTRUMENT_TYPE(CustomEnum):
     CONVERTIBLE = "Convertible"
     SPOT = "Spot"
     REPO = "Repo"
+    REITs = "REITs"
 
 
 # noinspection PyPep8Naming
@@ -195,6 +202,7 @@ class EXCHANGE(CustomEnum):
     CZCE = "CZCE"
     CFFEX = "CFFEX"
     SGEX = "SGEX"
+    BJSE = "BJSE"
 
 
 # noinspection PyPep8Naming

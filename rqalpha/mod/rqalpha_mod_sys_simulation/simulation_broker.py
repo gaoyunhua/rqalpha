@@ -155,18 +155,19 @@ class SimulationBroker(AbstractBroker, Persistable):
                 self._env.event_bus.publish_event(Event(EVENT.ORDER_UNSOLICITED_UPDATE, account=account, order=order))
         self._open_exercise_orders.clear()
 
-    def on_bar(self, _):
+    def on_bar(self, event):
         for matcher in self._matchers.values():
-            matcher.update()
+            matcher.update(event)
         self._match()
 
     def on_tick(self, event):
         tick = event.tick
-        self._get_matcher(tick.order_book_id).update()
+        self._get_matcher(tick.order_book_id).update(event)
         self._match(tick.order_book_id)
 
     def _match(self, order_book_id=None):
-        order_filter = None if order_book_id is None else lambda a_and_o: a_and_o[1].order_book_id == order_book_id
+        # 撮合未完成的订单，若指定标的时只撮合指定的标的的订单
+        order_filter = lambda a_and_o: not (a_and_o[1].is_final() or (order_book_id and a_and_o[1].order_book_id != order_book_id))
         for account, order in filter(order_filter, self._open_orders):
             self._get_matcher(order.order_book_id).match(account, order, open_auction=False)
         for account, order in filter(order_filter, self._open_auction_orders):

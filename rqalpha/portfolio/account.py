@@ -30,6 +30,7 @@ from rqalpha.utils.functools import lru_cache
 from rqalpha.utils.i18n import gettext as _
 from rqalpha.utils.logger import user_system_log
 from rqalpha.portfolio.position import Position, PositionProxyDict
+from rqalpha.mod.rqalpha_mod_sys_accounts.position_model import FuturePosition
 
 OrderApiType = Callable[[str, Union[int, float], OrderStyle, bool], List[Order]]
 
@@ -81,6 +82,7 @@ class Account(metaclass=AccountMeta):
 
         for order_book_id, (init_quantity, init_price) in init_positions.items():
             position_direction = POSITION_DIRECTION.LONG if init_quantity > 0 else POSITION_DIRECTION.SHORT
+            init_quantity = abs(init_quantity) if init_quantity < 0 else init_quantity
             self._get_or_create_pos(order_book_id, position_direction, init_quantity, init_price)
 
     def __repr__(self):
@@ -99,12 +101,12 @@ class Account(metaclass=AccountMeta):
             EVENT.TRADE, lambda e: self.apply_trade(e.trade, e.order) if e.account == self else None
         )
         event_bus.add_listener(EVENT.ORDER_PENDING_NEW, self._on_order_pending_new)
-        event_bus.add_listener(EVENT.ORDER_CREATION_REJECT, self._on_order_unsolicited_update)
         event_bus.add_listener(EVENT.ORDER_UNSOLICITED_UPDATE, self._on_order_unsolicited_update)
         event_bus.add_listener(EVENT.ORDER_CANCELLATION_PASS, self._on_order_unsolicited_update)
 
         event_bus.add_listener(EVENT.PRE_BEFORE_TRADING, self._on_before_trading)
         event_bus.add_listener(EVENT.SETTLEMENT, self._on_settlement)
+        event_bus.add_listener(EVENT.POST_SETTLEMENT, self._post_settlement)
 
         event_bus.prepend_listener(EVENT.BAR, self._on_bar)
         event_bus.prepend_listener(EVENT.TICK, self._on_tick)
@@ -179,8 +181,8 @@ class Account(metaclass=AccountMeta):
         except KeyError:
             return Position(order_book_id, direction)
 
-    def calc_close_today_amount(self, order_book_id, trade_amount, position_direction):
-        return self._get_or_create_pos(order_book_id, position_direction).calc_close_today_amount(trade_amount)
+    def calc_close_today_amount(self, order_book_id, trade_amount, position_direction, position_effect):
+        return self._get_or_create_pos(order_book_id, position_direction).calc_close_today_amount(trade_amount, position_effect)
 
     @property
     def type(self):
@@ -318,7 +320,7 @@ class Account(metaclass=AccountMeta):
                 del self._positions[order_book_id]
 
         trading_date = self._env.trading_dt.date()
-        while self._pending_deposit_withdraw and self._pending_deposit_withdraw[0][0] <= trading_date:
+        while self._pending_deposit_withdraw and self._pending_deposit_withdraw[0][0].date() <= trading_date:
             _, amount = self._pending_deposit_withdraw.pop(0)
             self._total_cash += amount
 
@@ -343,6 +345,10 @@ class Account(metaclass=AccountMeta):
         self._management_fees += fee
         self._total_cash -= fee
 
+        # 如果期货结算结束时 cash 为负数，抛出提醒给到用户
+        if self._type == "FUTURE" and self.cash < 0:
+            user_system_log.warn(_("Futures account's cash turns negative after settlement"))
+
         # 如果 total_value <= 0 则认为已爆仓，清空仓位，资金归0
         forced_liquidation = self._env.config.base.forced_liquidation
         if self.total_value <= 0 and forced_liquidation:
@@ -350,6 +356,16 @@ class Account(metaclass=AccountMeta):
                 user_system_log.warn(_("Trigger Forced Liquidation, current total_value is 0"))
             self._positions.clear()
             self._total_cash = 0
+    
+    def _post_settlement(self, event):
+        # type: (EVENT) -> None
+        """
+        该事件必须在 post_settlement 中最后执行，若有其他事件要加入到 post_settlement 中，请使用 event_bus.prepend_listener 添加
+        """
+        for order_book_id, positions in list(self._positions.items()):
+            for position in six.itervalues(positions):
+                if isinstance(position, FuturePosition):
+                    position.post_settlement()
 
     def _on_order_pending_new(self, event):
         if event.account != self:
@@ -443,7 +459,7 @@ class Account(metaclass=AccountMeta):
     def _frozen_cash_of_order(self, order):
         if order.position_effect == POSITION_EFFECT.OPEN:
             instrument = self._env.data_proxy.instrument(order.order_book_id)
-            order_cost = instrument.calc_cash_occupation(order.frozen_price, order.quantity, order.position_direction)
+            order_cost = instrument.calc_cash_occupation(order.frozen_price, order.quantity, order.position_direction, order.trading_datetime.date())
         else:
             order_cost = 0
         return order_cost + self._env.get_order_transaction_cost(order)

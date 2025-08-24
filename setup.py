@@ -17,7 +17,8 @@ import versioneer
 
 requirements = [
     'requests',
-    'numpy',
+    'numpy < 2.0.0 ; python_version <= "3.11"',
+    'numpy >=2.0.0 ; python_version >= "3.12"',
     'pandas >=1.0.5',
     'python-dateutil',
     'six',
@@ -27,11 +28,12 @@ requirements = [
     'simplejson',
     'PyYAML',
     'tabulate',
-    'rqrisk >=1.0.3',
+    'rqrisk >=1.0.6',
     'h5py',
-    'matplotlib >=2.2.0',
+    'matplotlib >=3.1.0',
     "openpyxl",
-    "methodtools"
+    "methodtools",
+    "filelock"
 ]
 
 if sys.version_info < (3, 5):
@@ -54,7 +56,7 @@ setup(
     author='ricequant',
     author_email='public@ricequant.com',
     license='Apache License v2',
-    include_package_date=True,
+    include_package_data=True,
     package_data={
         'rqalpha': ['*.yml',
                     'examples/*.*', 'examples/data_source/*.*', 'examples/extend_api/*.*',
@@ -64,7 +66,7 @@ setup(
     },
     url='https://github.com/ricequant/rqalpha',
     install_requires=requirements,
-    extra_requires={
+    extras_require={
         'profiler': ["line_profiler"],
     },
     zip_safe=False,
@@ -81,6 +83,9 @@ setup(
         'Programming Language :: Python :: 3.8',
         'Programming Language :: Python :: 3.9',
         'Programming Language :: Python :: 3.10',
+        'Programming Language :: Python :: 3.11',
+        'Programming Language :: Python :: 3.12',
+        'Programming Language :: Python :: 3.13',
     ],
     python_requires=">=3.6"
 )

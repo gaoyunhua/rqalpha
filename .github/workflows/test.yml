@@ -3,40 +3,48 @@ on: [push, pull_request]
 
 jobs:
   test:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     strategy:
       matrix:
-        python-version: ["3.6", "3.7", "3.8", "3.9", "3.10"]
+        python-version: ["3.7", "3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
     steps:
     # Checks out a copy of your repository on the ubuntu-latest machine
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
     - name: Set up Python
-      uses: actions/setup-python@v1
+      uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
-    - name: Cache bundle
+    - name: Cache dependencies
       # cache will change when runner.os or requirements.txt changed
-      uses: actions/cache@v2
+      uses: actions/cache@v4
       id: cache
       with:
         path: |
-          $HOME/.cache/pip
-          $HOME/.rqalpha/bundle
-        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-    - name: Install dependencies and download-bundle
+          ~/.cache/pip
+          ~/.local
+          /usr/local/lib/ta-lib
+        key: ${{ runner.os }}-py-${{ matrix.python-version }}-deps-${{ hashFiles('**/requirements.txt') }}
+    - name: Install Python dependencies
       run: |
         # Install TA-Lib
-          wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz
-          tar -xzvf ta-lib-0.4.0-src.tar.gz
-          cd ta-lib
-          ./configure --prefix=/usr
-          make
-          sudo make install
-          cd ..
+          # wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz
+          # tar -xzvf ta-lib-0.4.0-src.tar.gz
+          # cd ta-lib
+          # ./configure --prefix=/usr
+          # make
+          # sudo make install
+          # cd ..
         # Install Test Deps
           pip install -U pip
-          pip install "numpy>=1.15.4"
-          pip install TA-Lib
+          # Install numpy based on Python version
+          pip install build
+          if python -c "import sys; exit(0 if sys.version_info < (3, 12) else 1)"; then
+            pip install "numpy<2.0.0"
+            pip install TA-Lib==0.4.38 -i https://rquser:Ricequant8@pypi2.ricequant.com/simple/
+          else
+            pip install "numpy>=2.0.0"
+            pip install "TA-Lib>=0.6.5" -i https://rquser:Ricequant8@pypi2.ricequant.com/simple/
+          fi
           pip install coveralls
           pip install -U setuptools
           pip install ipython==5.3.0
@@ -57,7 +65,7 @@ jobs:
         COVERALLS_FLAG_NAME: ${{ matrix.python-version }}
         COVERALLS_PARALLEL: true
       run: |
-        coveralls --service=github
+        python -m coveralls --service=github
 
   coveralls:
     name: Indicate completion to coveralls.io
@@ -69,6 +77,6 @@ jobs:
     - name: Finished
       run: |
         pip3 install --upgrade coveralls
-        coveralls --finish
+        python -m coveralls --finish
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -118,16 +118,20 @@ def init_rqdatac(rqdatac_uri):
     except ImportError:
         return
 
-    if isinstance(rqdatac.client.get_client(), rqdatac.client.DummyClient):
+    if rqdatac.initialized():
+        return True
+    else:
         init_rqdatac_env(rqdatac_uri)
         try:
             rqdatac.init()
+            return True
         except Exception as e:
             system_log.warn(_('rqdatac init failed, some apis will not function properly: {}').format(str(e)))
+            return
 
 
 def run(config, source_code=None, user_funcs=None):
-    env = Environment(config)
+    env = Environment(config, init_rqdatac(getattr(config.base, 'rqdatac_uri', None)))
     persist_helper = None
     init_succeed = False
     mod_handler = ModHandler()
@@ -136,7 +140,6 @@ def run(config, source_code=None, user_funcs=None):
         # avoid register handlers everytime
         # when running in ipython
         set_loggers(config)
-        init_rqdatac(getattr(config.base, 'rqdatac_uri', None))
         system_log.debug("\n" + pformat(config.convert_to_dict()))
 
         env.set_strategy_loader(init_strategy_loader(env, source_code, user_funcs, config))
@@ -144,7 +147,12 @@ def run(config, source_code=None, user_funcs=None):
         mod_handler.start_up()
 
         if not env.data_source:
-            env.set_data_source(BaseDataSource(config.base.data_bundle_path, getattr(config.base, "future_info", {})))
+            env.set_data_source(BaseDataSource(
+                config.base.data_bundle_path, 
+                getattr(config.base, "future_info", {}),
+                const.DEFAULT_ACCOUNT_TYPE.FUTURE in config.base.accounts and config.base.futures_time_series_trading_parameters,
+                config.base.end_date
+            ))
         if env.price_board is None:
             from rqalpha.data.bar_dict_price_board import BarDictPriceBoard
             env.price_board = BarDictPriceBoard()
@@ -266,9 +274,9 @@ def enable_profiler(env, scope):
     for name in scope:
         obj = scope[name]
         # 针对 run_func
-        func_cond = getattr(obj, "__globals__", None) and obj.__globals__.get("__name__", None) == "rqalpha.user_module"
+        func_cond = "__globals__" in dir(obj) and obj.__globals__.get("__name__", None) == "rqalpha.user_module"
         # 针对 run_code 和 run_file
-        file_or_code_cond = getattr(obj, "__module__", None) == "rqalpha.user_module"
+        file_or_code_cond = "__module__" in dir(obj) and obj.__module__ == "rqalpha.user_module"
         if not any([func_cond, file_or_code_cond]):
             continue
         if inspect.isfunction(obj):
@@ -303,3 +311,6 @@ def set_loggers(config):
 
     for logger_name, level in extra_config.logger:
         getattr(logger, logger_name).level = getattr(logbook, level.upper())
+
+    if getattr(extra_config, "log_file", None):
+        logbook.FileHandler(filename=extra_config.log_file, mode="a").push_application()

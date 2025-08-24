@@ -18,7 +18,9 @@
 import re
 import copy
 import datetime
+import inspect
 from typing import Dict, Callable, Optional
+from methodtools import lru_cache
 
 import numpy as np
 from dateutil.parser import parse
@@ -46,10 +48,9 @@ class Instrument(metaclass=PropertyReprMeta):
 
     __repr__ = property_repr
 
-    def __init__(self, dic, future_tick_size_getter=None):
-        # type: (Dict, Optional[Callable[[Instrument], float]]) -> None
+    def __init__(self, dic: Dict, futures_tick_size_getter: Optional[Callable] = None, *args, **kwrags) -> None:
         self.__dict__ = copy.copy(dic)
-        self._future_tick_size_getter = future_tick_size_getter
+        self._futures_tick_size_getter = futures_tick_size_getter
 
         if "listed_date" in dic:
             self.__dict__["listed_date"] = self._fix_date(dic["listed_date"])
@@ -236,13 +237,6 @@ class Instrument(metaclass=PropertyReprMeta):
         return self.__dict__.get('contract_multiplier', 1)
 
     @property
-    def margin_rate(self):
-        """
-        [float] 合约最低保证金率（期货专用）
-        """
-        return self.__dict__.get("margin_rate", 1)
-
-    @property
     def underlying_order_book_id(self):
         """
         [str] 合约标的代码，目前除股指期货(IH, IF, IC)之外的期货合约，这一字段全部为’null’（期货专用）
@@ -375,6 +369,14 @@ class Instrument(metaclass=PropertyReprMeta):
                 trading_period.append(TimeRange(start, end))
         return trading_period
 
+    def during_continuous_auction(self, time):
+        # type: (datetime.time) -> bool
+        """ 是否处于连续竞价时间段内 """
+        for time_range in self.trading_hours:
+            if time_range.start <= time <= time_range.end:
+                return True
+        return False
+
     @property
     def trading_code(self):
         # type: () -> str
@@ -436,17 +438,35 @@ class Instrument(metaclass=PropertyReprMeta):
         elif self.type in ("ETF", "LOF"):
             return 0.001
         elif self.type == INSTRUMENT_TYPE.FUTURE:
-            return self._future_tick_size_getter(self)
+            return self._futures_tick_size_getter(self)
         else:
             raise NotImplementedError
 
-    def calc_cash_occupation(self, price, quantity, direction):
-        # type: (float, float, POSITION_DIRECTION) -> float
+    @lru_cache(8)
+    def get_long_margin_ratio(self, dt: datetime.date) -> float:
+        """
+        获取多头保证金率（期货专用）
+        """
+        return Environment.get_instance().data_proxy.get_futures_trading_parameters(self.order_book_id, dt).long_margin_ratio
+
+    @lru_cache(8)
+    def get_short_margin_ratio(self, dt: datetime.date) -> float:
+        """
+        获取空头保证金率（期货专用）
+        """
+        return Environment.get_instance().data_proxy.get_futures_trading_parameters(self.order_book_id, dt).short_margin_ratio
+
+    def calc_cash_occupation(self, price, quantity, direction, dt):
+        # type: (float, int, POSITION_DIRECTION, datetime.date) -> float
         if self.type in INST_TYPE_IN_STOCK_ACCOUNT:
             return price * quantity
         elif self.type == INSTRUMENT_TYPE.FUTURE:
             margin_multiplier = Environment.get_instance().config.base.margin_multiplier
-            return price * quantity * self.contract_multiplier * self.margin_rate * margin_multiplier
+            if direction == POSITION_DIRECTION.LONG:
+                margin_rate = self.get_long_margin_ratio(dt)
+            elif direction == POSITION_DIRECTION.SHORT:
+                margin_rate = self.get_short_margin_ratio(dt)
+            return price * quantity * self.contract_multiplier * margin_rate * margin_multiplier
         else:
             raise NotImplementedError
 

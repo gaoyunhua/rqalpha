@@ -50,6 +50,10 @@ class AccountMod(AbstractMod):
         elif mod_config.financing_rate < 0:
             raise ValueError("sys_accounts financing_rate must >= 0")
 
+        futures_settlement_price_types = ["settlement", "close"]
+        if mod_config.futures_settlement_price_type not in futures_settlement_price_types:
+            raise ValueError("sys_accounts futures_settlement_price_type in {}".format(futures_settlement_price_types))
+
         if DEFAULT_ACCOUNT_TYPE.FUTURE in env.config.base.accounts:
             # 注入期货API
             # noinspection PyUnresolvedReferences
@@ -74,6 +78,7 @@ class AccountMod(AbstractMod):
                         env.add_frontend_validator(ins_validator, INSTRUMENT_TYPE.CONVERTIBLE)
                         env.add_frontend_validator(ins_validator, INSTRUMENT_TYPE.INDX)
                         env.add_frontend_validator(ins_validator, INSTRUMENT_TYPE.PUBLIC_FUND)
+                        env.add_frontend_validator(ins_validator, INSTRUMENT_TYPE.REITs)
                     else:
                         user_system_log.warn("rqdatac not init, not support financing stocks restriction.")
                 except ImportError:

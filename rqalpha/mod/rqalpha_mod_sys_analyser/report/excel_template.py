@@ -70,9 +70,10 @@ class VerticalSeriesSchema(SheetSchema):
         if not data:
             for key, (row, column, style) in self._cell_map.items():
                 self._write_cell(ws, row, column, None, style)
-        for key, (row, column, style) in self._cell_map.items():
-            for i, item in enumerate(data.get(key, [])):
-                self._write_cell(ws, row + i, column, item, style)
+        else:
+            for key, (row, column, style) in self._cell_map.items():
+                for i, item in enumerate(data.get(key, [])):
+                    self._write_cell(ws, row + i, column, item, style)
 
 
 class SummaryTemplate(ExcelTemplate):
@@ -81,7 +82,9 @@ class SummaryTemplate(ExcelTemplate):
         "概览": SingleCellSchema,
         "年度指标": VerticalSeriesSchema,
         "月度收益": VerticalSeriesSchema,
-        "月度主动收益": VerticalSeriesSchema
+        "月度超额收益（几何）": VerticalSeriesSchema,
+        "个股权重": VerticalSeriesSchema,
+        "压力测试": VerticalSeriesSchema,
     }
 
 

@@ -23,7 +23,7 @@ import sys
 from copy import copy
 from itertools import chain
 from contextlib import contextmanager
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, Optional, NamedTuple
 
 import h5py
 import numpy as np
@@ -34,11 +34,24 @@ from rqalpha.const import COMMISSION_TYPE, INSTRUMENT_TYPE
 from rqalpha.model.instrument import Instrument
 from rqalpha.utils.datetime_func import convert_date_to_date_int
 from rqalpha.utils.i18n import gettext as _
+from rqalpha.utils.logger import user_system_log
 
 from .storage_interface import (AbstractCalendarStore, AbstractDateSet,
                                 AbstractDayBarStore, AbstractDividendStore,
                                 AbstractInstrumentStore,
                                 AbstractSimpleFactorStore)
+
+
+class FuturesTradingParameters(NamedTuple):
+    """
+    数据类，用以存储期货交易参数数据
+    """
+    close_commission_ratio: float
+    close_commission_today_ratio: float
+    commission_type: str
+    open_commission_ratio: float
+    long_margin_ratio: float
+    short_margin_ratio: float
 
 
 class ExchangeTradingCalendarStore(AbstractCalendarStore):
@@ -64,27 +77,53 @@ class FutureInfoStore(object):
                 ) for item in json.load(json_file)
             }
         self._custom_data = custom_future_info
-        self._future_info = {}
+        if "margin_rate" not in self._default_data[next(iter(self._default_data))]:
+            raise RuntimeError(_("The bundle data you are using is too old, please update it to lastest before using"))
 
     @classmethod
     def _process_future_info_item(cls, item):
         item["commission_type"] = cls.COMMISSION_TYPE_MAP[item["commission_type"]]
         return item
 
-    def get_future_info(self, instrument):
-        # type: (Instrument) -> Dict[str, float]
-        order_book_id = instrument.order_book_id
+    @lru_cache(1024)
+    def get_future_info(self, order_book_id, underlying_symbol):
+        # type: (str, str) -> FuturesTradingParameters
+        custom_info = self._custom_data.get(order_book_id) or self._custom_data.get(underlying_symbol)
+        info = self._default_data.get(order_book_id) or self._default_data.get(underlying_symbol)
+        if custom_info:
+            info = copy(info) or {}
+            info.update(custom_info)
+        elif not info:
+            raise NotImplementedError(_("unsupported future instrument {}").format(order_book_id))
+        info = self._to_namedtuple(info)
+        return info
+    
+    def _to_namedtuple(self, info):
+        # type: (dict) -> FuturesTradingParameters
+        futures_info = copy(info)
+        futures_info['long_margin_ratio'], futures_info['short_margin_ratio'] = futures_info['margin_rate'], futures_info['margin_rate']
+        del futures_info['margin_rate'], futures_info['tick_size']
         try:
-            return self._future_info[order_book_id]
+            del futures_info['order_book_id']
         except KeyError:
-            custom_info = self._custom_data.get(order_book_id) or self._custom_data.get(instrument.underlying_symbol)
-            info = self._default_data.get(order_book_id) or self._default_data.get(instrument.underlying_symbol)
-            if custom_info:
-                info = copy(info) or {}
-                info.update(custom_info)
-            elif not info:
-                raise NotImplementedError(_("unsupported future instrument {}").format(order_book_id))
-            return self._future_info.setdefault(order_book_id, info)
+            del futures_info['underlying_symbol']
+        futures_info = FuturesTradingParameters(**futures_info)
+        return futures_info
+    
+    @lru_cache(8)
+    def get_tick_size(self, instrument):
+        # type: (str, str) -> float
+        order_book_id = instrument.order_book_id
+        underlying_symbol = instrument.underlying_symbol
+        custom_info = self._custom_data.get(order_book_id) or self._custom_data.get(underlying_symbol)
+        info = self._default_data.get(order_book_id) or self._default_data.get(underlying_symbol)
+        if custom_info:
+            info = copy(info) or {}
+            info.update(custom_info)
+        elif not info:
+            raise NotImplementedError(_("unsupported future instrument {}".format(order_book_id)))
+        tick_size = info['tick_size']
+        return tick_size
 
 
 class InstrumentStore(AbstractInstrumentStore):

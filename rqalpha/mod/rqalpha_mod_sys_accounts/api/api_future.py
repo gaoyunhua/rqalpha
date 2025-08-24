@@ -18,13 +18,15 @@
 from __future__ import division
 from typing import Union, Optional, List
 
+import numpy as np
+
 from rqalpha.api import export_as_api
 from rqalpha.apis.api_base import assure_instrument
-from rqalpha.apis.api_abstract import order, order_to, buy_open, buy_close, sell_open, sell_close
+from rqalpha.apis.api_abstract import order, order_to, buy_open, buy_close, sell_open, sell_close, PRICE_OR_STYLE_TYPE
 from rqalpha.apis.api_base import cal_style
 from rqalpha.apis.api_rqdatac import futures
 from rqalpha.environment import Environment
-from rqalpha.model.order import Order, LimitOrder, OrderStyle
+from rqalpha.model.order import Order, LimitOrder, OrderStyle, ALGO_ORDER_STYLES
 from rqalpha.const import SIDE, POSITION_EFFECT, ORDER_TYPE, RUN_TYPE, INSTRUMENT_TYPE, POSITION_DIRECTION
 from rqalpha.model.instrument import Instrument
 from rqalpha.portfolio.position import Position
@@ -35,8 +37,7 @@ from rqalpha.utils.i18n import gettext as _
 from rqalpha.utils.arg_checker import apply_rules, verify_that
 
 
-__all__ = [
-]
+__all__ = []
 
 
 def _submit_order(id_or_ins, amount, side, position_effect, style):
@@ -46,13 +47,13 @@ def _submit_order(id_or_ins, amount, side, position_effect, style):
 
     amount = int(amount)
     if amount == 0:
-        user_system_log.warn(_(
-            u"Order Creation Failed: 0 order quantity, order_book_id={order_book_id}"
-        ).format(order_book_id=order_book_id))
+        reason = _(u"Order Creation Failed: 0 order quantity, order_book_id={order_book_id}").format(
+            order_book_id=order_book_id
+        )
+        env.order_creation_failed(order_book_id=order_book_id, reason=reason)
         return None
-    if isinstance(style, LimitOrder) and style.get_limit_price() <= 0:
-        raise RQInvalidArgument(_(u"Limit order price should be positive"))
-
+    if isinstance(style, LimitOrder) and np.isnan(style.get_limit_price()):
+        raise RQInvalidArgument(_(u"Limit order price should not be nan."))
 
     if env.config.base.run_type != RUN_TYPE.BACKTEST and instrument.type == INSTRUMENT_TYPE.FUTURE:
         if "88" in order_book_id:
@@ -62,12 +63,9 @@ def _submit_order(id_or_ins, amount, side, position_effect, style):
 
     price = env.get_last_price(order_book_id)
     if not is_valid_price(price):
-        user_system_log.warn(
-            _(u"Order Creation Failed: [{order_book_id}] No market data").format(order_book_id=order_book_id)
-        )
+        reason = _(u"Order Creation Failed: [{order_book_id}] No market data").format(order_book_id=order_book_id)
+        env.order_creation_failed(order_book_id=order_book_id, reason=reason)
         return
-
-    env = Environment.get_instance()
 
     orders = []
     if position_effect in (POSITION_EFFECT.CLOSE_TODAY, POSITION_EFFECT.CLOSE):
@@ -75,10 +73,11 @@ def _submit_order(id_or_ins, amount, side, position_effect, style):
         position = env.portfolio.get_position(order_book_id, direction)  # type: Position
         if position_effect == POSITION_EFFECT.CLOSE_TODAY:
             if amount > position.today_closable:
-                user_system_log.warning(_(
+                reason = _(
                     "Order Creation Failed: "
-                    "close today amount {amount} is larger than today closable quantity {quantity}"
-                ).format(amount=amount, quantity=position.today_closable))
+                    "close today amount {amount} is larger than today closable quantity {quantity}").format(
+                        amount=amount, quantity=position.today_closable)
+                env.order_creation_failed(order_book_id=order_book_id, reason=reason)
                 return []
             orders.append(Order.__from_create__(
                 order_book_id, amount, side, style, POSITION_EFFECT.CLOSE_TODAY
@@ -86,10 +85,9 @@ def _submit_order(id_or_ins, amount, side, position_effect, style):
         else:
             quantity, old_quantity = position.quantity, position.old_quantity
             if amount > quantity:
-                user_system_log.warn(_(
-                    u"Order Creation Failed: close amount {amount} is larger than position quantity {quantity}").format(
-                    amount=amount, quantity=quantity
-                ))
+                reason = _(u"Order Creation Failed: close amount {amount} is larger than position quantity {quantity}").format(
+                    amount=amount, quantity=quantity)
+                env.order_creation_failed(order_book_id=order_book_id, reason=reason)
                 return []
             if amount > old_quantity:
                 if old_quantity != 0:
@@ -121,8 +119,6 @@ def _submit_order(id_or_ins, amount, side, position_effect, style):
         )
 
     for o in orders:
-        if o.type == ORDER_TYPE.MARKET:
-            o.set_frozen_price(price)
         if env.can_submit_order(o):
             env.broker.submit_order(o)
         else:
@@ -176,37 +172,37 @@ def _order(order_book_id, quantity, style, target):
 
 
 @order.register(INSTRUMENT_TYPE.FUTURE)
-def future_order(order_book_id, quantity, price=None, style=None):
-    # type: (Union[str, Instrument], int, Optional[float], Optional[OrderStyle]) -> List[Order]
-    return _order(order_book_id, quantity, cal_style(price, style), False)
+def future_order(order_book_id, quantity, price_or_style=None, price=None, style=None):
+    # type: (Union[str, Instrument], int, PRICE_OR_STYLE_TYPE, Optional[float], Optional[OrderStyle]) -> List[Order]
+    return _order(order_book_id, quantity, cal_style(price, style, price_or_style), False)
 
 
 @order_to.register(INSTRUMENT_TYPE.FUTURE)
-def future_order_to(order_book_id, quantity, price=None, style=None):
-    # type: (Union[str, Instrument], int, Optional[float], Optional[OrderStyle]) -> List[Order]
-    return _order(order_book_id, quantity, cal_style(price, style), True)
+def future_order_to(order_book_id, quantity, price_or_style=None, price=None, style=None):
+    # type: (Union[str, Instrument], int, PRICE_OR_STYLE_TYPE, Optional[float], Optional[OrderStyle]) -> List[Order]
+    return _order(order_book_id, quantity, cal_style(price, style, price_or_style), True)
 
 
 @buy_open.register(INSTRUMENT_TYPE.FUTURE)
-def future_buy_open(id_or_ins, amount, price=None, style=None):
-    return _submit_order(id_or_ins, amount, SIDE.BUY, POSITION_EFFECT.OPEN, cal_style(price, style))
+def future_buy_open(id_or_ins, amount, price_or_style=None, price=None, style=None):
+    return _submit_order(id_or_ins, amount, SIDE.BUY, POSITION_EFFECT.OPEN, cal_style(price, style, price_or_style))
 
 
 @buy_close.register(INSTRUMENT_TYPE.FUTURE)
-def future_buy_close(id_or_ins, amount, price=None, style=None, close_today=False):
+def future_buy_close(id_or_ins, amount, price_or_style=None, price=None, style=None, close_today=False):
     position_effect = POSITION_EFFECT.CLOSE_TODAY if close_today else POSITION_EFFECT.CLOSE
-    return _submit_order(id_or_ins, amount, SIDE.BUY, position_effect, cal_style(price, style))
+    return _submit_order(id_or_ins, amount, SIDE.BUY, position_effect, cal_style(price, style, price_or_style))
 
 
 @sell_open.register(INSTRUMENT_TYPE.FUTURE)
-def future_sell_open(id_or_ins, amount, price=None, style=None):
-    return _submit_order(id_or_ins, amount, SIDE.SELL, POSITION_EFFECT.OPEN, cal_style(price, style))
+def future_sell_open(id_or_ins, amount, price_or_style=None, price=None, style=None):
+    return _submit_order(id_or_ins, amount, SIDE.SELL, POSITION_EFFECT.OPEN, cal_style(price, style, price_or_style))
 
 
 @sell_close.register(INSTRUMENT_TYPE.FUTURE)
-def future_sell_close(id_or_ins, amount, price=None, style=None, close_today=False):
+def future_sell_close(id_or_ins, amount, price_or_style=None, price=None, style=None, close_today=False):
     position_effect = POSITION_EFFECT.CLOSE_TODAY if close_today else POSITION_EFFECT.CLOSE
-    return _submit_order(id_or_ins, amount, SIDE.SELL, position_effect, cal_style(price, style))
+    return _submit_order(id_or_ins, amount, SIDE.SELL, position_effect, cal_style(price, style, price_or_style))
 
 
 @export_as_api

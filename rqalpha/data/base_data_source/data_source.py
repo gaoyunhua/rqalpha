@@ -16,7 +16,6 @@
 #         详细的授权流程，请联系 public@ricequant.com 获取。
 import os
 import pickle
-from functools import lru_cache
 from datetime import date, datetime, timedelta
 from itertools import groupby
 from typing import Dict, Iterable, List, Optional, Sequence, Union
@@ -24,6 +23,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Union
 import numpy as np
 import pandas as pd
 import six
+from rqalpha.utils.i18n import gettext as _
 from rqalpha.const import INSTRUMENT_TYPE, TRADING_CALENDAR_TYPE
 from rqalpha.interface import AbstractDataSource
 from rqalpha.model.instrument import Instrument
@@ -32,16 +32,15 @@ from rqalpha.utils.exception import RQInvalidArgument
 from rqalpha.utils.functools import lru_cache
 from rqalpha.utils.typing import DateLike
 from rqalpha.environment import Environment
-
 from rqalpha.data.base_data_source.adjust import FIELDS_REQUIRE_ADJUSTMENT, adjust_bars
 from rqalpha.data.base_data_source.storage_interface import (AbstractCalendarStore, AbstractDateSet,
                                 AbstractDayBarStore, AbstractDividendStore,
                                 AbstractInstrumentStore)
 from rqalpha.data.base_data_source.storages import (DateSet, DayBarStore, DividendStore,
                        ExchangeTradingCalendarStore, FutureDayBarStore,
-                       FutureInfoStore, InstrumentStore,
+                       FutureInfoStore,InstrumentStore,
                        ShareTransformationStore, SimpleFactorStore,
-                       YieldCurveStore)
+                       YieldCurveStore, FuturesTradingParameters)
 
 
 BAR_RESAMPLE_FIELD_METHODS = {
@@ -68,10 +67,10 @@ BAR_RESAMPLE_FIELD_METHODS = {
 class BaseDataSource(AbstractDataSource):
     DEFAULT_INS_TYPES = (
         INSTRUMENT_TYPE.CS, INSTRUMENT_TYPE.FUTURE, INSTRUMENT_TYPE.ETF, INSTRUMENT_TYPE.LOF, INSTRUMENT_TYPE.INDX,
-        INSTRUMENT_TYPE.PUBLIC_FUND,
+        INSTRUMENT_TYPE.PUBLIC_FUND, INSTRUMENT_TYPE.REITs
     )
 
-    def __init__(self, path, custom_future_info):
+    def __init__(self, path: str, custom_future_info: dict, *args, **kwargs) -> None:
         if not os.path.exists(path):
             raise RuntimeError('bundle path {} not exist'.format(os.path.abspath(path)))
 
@@ -84,22 +83,27 @@ class BaseDataSource(AbstractDataSource):
             INSTRUMENT_TYPE.INDX: DayBarStore(_p('indexes.h5')),
             INSTRUMENT_TYPE.FUTURE: FutureDayBarStore(_p('futures.h5')),
             INSTRUMENT_TYPE.ETF: funds_day_bar_store,
-            INSTRUMENT_TYPE.LOF: funds_day_bar_store
+            INSTRUMENT_TYPE.LOF: funds_day_bar_store,
+            INSTRUMENT_TYPE.REITs: funds_day_bar_store
         }  # type: Dict[INSTRUMENT_TYPE, AbstractDayBarStore]
-
+        
         self._future_info_store = FutureInfoStore(_p("future_info.json"), custom_future_info)
-
+        
         self._instruments_stores = {}  # type: Dict[INSTRUMENT_TYPE, AbstractInstrumentStore]
         self._ins_id_or_sym_type_map = {}  # type: Dict[str, INSTRUMENT_TYPE]
         instruments = []
+        
+        env = Environment.get_instance()
         with open(_p('instruments.pk'), 'rb') as f:
             for i in pickle.load(f):
                 if i["type"] == "Future" and Instrument.is_future_continuous_contract(i["order_book_id"]):
                     i["listed_date"] = datetime(1990, 1, 1)
-                instruments.append(Instrument(i, lambda i: self._future_info_store.get_future_info(i)["tick_size"]))
+                instruments.append(Instrument(
+                    i, 
+                    lambda i: self._future_info_store.get_tick_size(i),
+                    ))
         for ins_type in self.DEFAULT_INS_TYPES:
             self.register_instruments_store(InstrumentStore(instruments, ins_type))
-
         dividend_store = DividendStore(_p('dividends.h5'))
         self._dividends = {
             INSTRUMENT_TYPE.CS: dividend_store,
@@ -359,11 +363,20 @@ class BaseDataSource(AbstractDataSource):
     def get_yield_curve(self, start_date, end_date, tenor=None):
         return self._yield_curve.get_yield_curve(start_date, end_date, tenor=tenor)
 
-    def get_commission_info(self, instrument):
-        return self._future_info_store.get_future_info(instrument)
+    @lru_cache(1024)
+    def get_futures_trading_parameters(self, instrument: Instrument, dt: datetime.date) -> FuturesTradingParameters:
+        return self._future_info_store.get_future_info(instrument.order_book_id, instrument.underlying_symbol)
 
     def get_merge_ticks(self, order_book_id_list, trading_date, last_dt=None):
         raise NotImplementedError
 
     def history_ticks(self, instrument, count, dt):
         raise NotImplementedError
+
+    def get_algo_bar(self, id_or_ins, start_min, end_min, dt):
+        raise NotImplementedError("open source rqalpha not support algo order")
+
+    def get_open_auction_volume(self, instrument, dt):
+        # type: (Instrument, datetime.datetime) -> float
+        volume = self.get_open_auction_bar(instrument, dt)['volume']
+        return volume

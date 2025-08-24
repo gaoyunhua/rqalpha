@@ -136,7 +136,8 @@ INST_TYPE_IN_STOCK_ACCOUNT = [
     INSTRUMENT_TYPE.ETF,
     INSTRUMENT_TYPE.LOF,
     INSTRUMENT_TYPE.INDX,
-    INSTRUMENT_TYPE.PUBLIC_FUND
+    INSTRUMENT_TYPE.PUBLIC_FUND,
+    INSTRUMENT_TYPE.REITs
 ]
 
 
@@ -236,3 +237,15 @@ def get_trading_period(universe, accounts):
     from rqalpha.environment import Environment
     trading_period = STOCK_TRADING_PERIOD if DEFAULT_ACCOUNT_TYPE.STOCK in accounts else []
     return Environment.get_instance().data_proxy.get_trading_period(universe, trading_period)
+
+
+def safe_div(dividend, divisor):
+    return dividend / divisor if divisor else np.nan
+
+
+def check_items_in_container(items, should_in, name):
+    for item in items:
+        if item not in should_in:
+            raise ValueError(
+                "{}: got invalided value {}, choose any in {}".format(name, item, should_in)
+            )

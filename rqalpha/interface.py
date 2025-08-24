@@ -17,7 +17,9 @@
 
 import abc
 from datetime import datetime, date
-from typing import Any, Union, Optional, Iterable, Dict, List, Sequence
+from typing import Any, Union, Optional, Iterable, Dict, List, Sequence, TYPE_CHECKING
+if TYPE_CHECKING:
+    from rqalpha.portfolio.account import Account
 
 import numpy
 from six import with_metaclass
@@ -28,7 +30,7 @@ from rqalpha.model.tick import TickObject
 from rqalpha.model.order import Order
 from rqalpha.model.trade import Trade
 from rqalpha.model.instrument import Instrument
-from rqalpha.const import POSITION_DIRECTION, TRADING_CALENDAR_TYPE, INSTRUMENT_TYPE
+from rqalpha.const import POSITION_DIRECTION, TRADING_CALENDAR_TYPE, INSTRUMENT_TYPE, SIDE
 
 
 class AbstractPosition(with_metaclass(abc.ABCMeta)):
@@ -129,6 +131,51 @@ class AbstractPosition(with_metaclass(abc.ABCMeta)):
         # type: () -> Union[int, float]
         """
         返回当前持仓量
+        """
+        raise NotImplementedError
+
+    @property
+    @abc.abstractmethod
+    def avg_price(self):
+        # type: () -> Union[int, float]
+        """
+        开仓均价
+        """
+        raise NotImplementedError
+
+    @property
+    @abc.abstractmethod
+    def pnl(self):
+        # type: () -> float
+        """
+        该持仓的累计盈亏
+        """
+        raise NotImplementedError
+
+    @property
+    @abc.abstractmethod
+    def equity(self):
+        # type: () -> float
+        """
+        当前持仓市值
+        """
+        raise NotImplementedError
+
+    @property
+    @abc.abstractmethod
+    def prev_close(self):
+        # type: () -> float
+        """
+        昨日收盘价
+        """
+        raise NotImplementedError
+
+    @property
+    @abc.abstractmethod
+    def last_price(self):
+        # type: () -> float
+        """
+        当前最新价
         """
         raise NotImplementedError
 
@@ -302,6 +349,20 @@ class AbstractDataSource(object):
             datetime, open, limit_up, limit_down, volume, total_turnover
         """
         raise NotImplementedError
+    
+    def get_open_auction_volume(self, instrument, dt):
+        """
+        获取指定资产当日的集合竞价成交量
+
+        :param instrument: 合约对象
+        :type instrument: class:`~Instrument`
+
+        :param dt: 集合竞价时间
+        :type dt: datetime.datetime
+
+        :return: `float`
+        """
+        raise NotImplementedError
 
     def get_settle_price(self, instrument, date):
         """
@@ -409,11 +470,15 @@ class AbstractDataSource(object):
         """
         raise NotImplementedError
 
-    def get_commission_info(self, instrument):
+    def get_futures_trading_parameters(self, instrument, dt):
         """
-        获取合约的手续费信息
-        :param instrument:
-        :return:
+        获取期货合约的时序手续费信息
+        :param instrument: 合约对象
+        :type instrument: :class:`~Instrument`
+
+        :param datetime.datetime dt: 交易日
+        
+        :return: :class:`FuturesTradingParameters`
         """
         raise NotImplementedError
 
@@ -443,6 +508,11 @@ class AbstractDataSource(object):
 
     def is_st_stock(self, order_book_id, dates):
         # type: (str, Sequence[DateLike]) -> Sequence[bool]
+        raise NotImplementedError
+
+    def get_algo_bar(self, id_or_ins, start_min, end_min, dt):
+        # type: (Union[str, Instrument], int, int, datetime) -> Optional[numpy.void]
+        # 格式: (date, VWAP, TWAP, volume) -> 案例 (20200102, 16.79877183, 16.83271429, 144356044)
         raise NotImplementedError
 
 
@@ -585,18 +655,21 @@ class AbstractFrontendValidator(with_metaclass(abc.ABCMeta)):
 
     扩展模块可以通过 env.add_frontend_validator 添加自定义的前端风控逻辑
     """
-
     @abc.abstractmethod
-    def can_submit_order(self, order, account=None):
+    def validate_submission(self, order: Order, account: Optional['Account'] = None) -> Optional[str]:
         """
-        判断是否可以下单
+        进行下单前的验证，若通过则返回 None
+
+        :return: `Optional[str]`
         """
         raise NotImplementedError
-
+    
     @abc.abstractmethod
-    def can_cancel_order(self, order, account=None):
+    def validate_cancellation(self, order: Order, account: Optional['Account'] = None) -> Optional[str]:
         """
-        判读是否可以撤单
+        进行撤销订单前的验证，若通过则返回 None
+
+        :return: `Optional[str]`
         """
         raise NotImplementedError
 
@@ -606,25 +679,28 @@ class AbstractTransactionCostDecider((with_metaclass(abc.ABCMeta))):
     订单税费计算接口，通过实现次接口可以定义不同市场、不同合约的个性化税费计算逻辑。
     """
     @abc.abstractmethod
-    def get_trade_tax(self, trade):
-        # type: (Trade) -> float
+    def get_trade_tax(self, trade: Trade) -> float:
         """
         计算指定交易应付的印花税
         """
         raise NotImplementedError
 
     @abc.abstractmethod
-    def get_trade_commission(self, trade):
-        # type: (Trade) -> float
+    def get_trade_commission(self, trade: Trade) -> float:
         """
         计算指定交易应付的佣金
         """
         raise NotImplementedError
 
     @abc.abstractmethod
-    def get_order_transaction_cost(self, order):
-        # type: (Order) -> float
+    def get_order_transaction_cost(self, order: Order) -> float:
         """
         计算指定订单应付的交易成本（税 + 费）
+        """
+        raise NotImplementedError
+    
+    def get_transaction_cost_with_value(self, value: float, side: SIDE) -> float:
+        """
+        计算指定价格交易应付的交易成本（税 + 费）
         """
         raise NotImplementedError

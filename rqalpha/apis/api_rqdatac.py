@@ -13,6 +13,7 @@
 #         在此前提下，对本软件的使用同样需要遵守 Apache 2.0 许可，Apache 2.0 许可与本许可冲突之处，以本许可为准。
 #         详细的授权流程，请联系 public@ricequant.com 获取。
 import datetime
+from functools import lru_cache
 from typing import Union, Optional, Iterable, List
 
 import six
@@ -32,9 +33,12 @@ from rqalpha.utils.exception import RQInvalidArgument
 from rqalpha.apis.api_base import assure_order_book_id
 from rqalpha.utils.i18n import gettext as _
 from rqalpha.utils.logger import user_log
+from rqalpha.utils import check_items_in_container
 
 try:
     import rqdatac
+    from rqdatac.services.future import _get_future_factors_df
+    _get_all_future_factors_df = lru_cache(1)(_get_future_factors_df)
 except ImportError:
     class DummyRQDatac:
         __name__ = "rqdatac"
@@ -239,6 +243,7 @@ def get_margin_stocks(exchange=None, margin_type="all"):
     # type: (str, str) -> List[str]
     """
     获取某个日期深证、上证融资融券股票列表。
+
     :param exchange: 交易所，默认为 None，返回所有字段。可选字段包括：'XSHE', 'sz' 代表深交所；'XSHG', 'sh' 代表上交所
     :param margin_type: 'stock' 代表融券卖出，'cash'，代表融资买入，'all'，代表包含融资和融券，默认为'all'
     :return: 属于该概念的股票 order_book_id
@@ -250,7 +255,7 @@ def get_margin_stocks(exchange=None, margin_type="all"):
     .. code-block:: python3
         :linenos:
 
-        get_margin_stocks(date='20190819',exchange=None,margin_type='stock')
+        get_margin_stocks(exchange=None,margin_type='stock')
         # [Out]
         # ['000001.XSHE',
         # '000002.XSHE',
@@ -262,7 +267,7 @@ def get_margin_stocks(exchange=None, margin_type="all"):
     .. code-block::
         :linenos:
 
-        get_margin_stocks(date='20190819',exchange='XSHE',margin_type='stock')
+        get_margin_stocks(exchange='XSHE',margin_type='stock')
         # [Out]
         # ['000001.XSHE',
         # '000002.XSHE',
@@ -274,7 +279,7 @@ def get_margin_stocks(exchange=None, margin_type="all"):
     .. code-block::
         :linenos:
 
-        get_margin_stocks(date='20190819',exchange='XSHG',margin_type='cash')
+        get_margin_stocks(exchange='XSHG',margin_type='cash')
         # [Out]
         # ['510050.XSHG',
         # '510160.XSHG',
@@ -424,8 +429,8 @@ def get_securities_margin(
         order_book_ids,  # type: Union[str, Iterable[str]]
         count=1,  # type: Optional[int]
         fields=None,  # type: Optional[str]
-        expect_df=False  # type: Optional[bool]
-):  # type: (...) -> Union[pd.Series, pd.DataFrame, pd.Panel]
+        expect_df=True  # type: Optional[bool]
+):  # type: (...) -> Union[pd.Series, pd.DataFrame]
     """
     获取融资融券信息。包括 `深证融资融券数据 <http://www.szse.cn/main/disclosure/rzrqxx/rzrqjy/>`_ 以及 `上证融资融券数据 <http://www.sse.com.cn/market/othersdata/margin/detail/>`_ 情况。既包括个股数据，也包括市场整体数据。需要注意，融资融券的开始日期为2010年3月31日。
 
@@ -519,11 +524,15 @@ def get_securities_margin(
         start_dt = dt
     else:
         start_dt = data_proxy.get_previous_trading_date(dt, count - 1)
-
+    
+    overall_code = {"XSHG", "XSHE", "sh", "sz"}
     if isinstance(order_book_ids, six.string_types):
-        order_book_ids = assure_order_book_id(order_book_ids)
+        if order_book_ids not in overall_code:
+            order_book_ids = assure_order_book_id(order_book_ids)
     else:
-        order_book_ids = [assure_order_book_id(i) for i in order_book_ids]
+        overall_code_list = [i for i in order_book_ids if i in overall_code]
+        order_book_ids = [assure_order_book_id(i) for i in order_book_ids if i not in overall_code]
+        order_book_ids = order_book_ids + overall_code_list
 
     return rqdatac.get_securities_margin(order_book_ids, start_dt, dt, fields=fields, expect_df=expect_df)
 
@@ -995,6 +1004,135 @@ def _futures_get_warehouse_stocks(underlying_symbols, count=1):
     return rqdatac.futures.get_warehouse_stocks(underlying_symbols, start_date=start_date, end_date=end_date)
 
 
+VALID_ADJUST_TYPES = ['none', 'pre', 'post']
+VALID_ADJUST_METHODS = ['prev_close_spread', 'open_spread', 'prev_close_ratio', 'open_ratio']
+
+
+def _get_ex_factor(underlying_symbols, adjust_type, adjust_method, adjust_date):
+    df = _get_all_future_factors_df().loc[underlying_symbols].reset_index()
+    need_cols = ["underlying_symbol", "ex_date", "ex_factor"]
+    factor = df[df["ex_date"] <= adjust_date].rename(columns={adjust_method: "ex_factor"})[need_cols]
+
+    pre, ratio = adjust_type == 'pre', adjust_method.endswith('ratio')
+
+    def _process(x):
+        if ratio:
+            x['ex_cum_factor'] = x['ex_factor'].cumprod()
+            if pre:
+                x['ex_cum_factor'] = x['ex_cum_factor'] / x['ex_cum_factor'].iloc[-1]
+        else:
+            x['ex_cum_factor'] = x['ex_factor'].cumsum()
+            if pre:
+                x['ex_cum_factor'] = x['ex_cum_factor'] - x['ex_cum_factor'].iloc[-1]
+        return x.set_index('ex_date')
+
+    factor = factor.groupby('underlying_symbol', as_index=True).apply(_process)
+    return factor['ex_cum_factor']
+
+
+DOMINANT_PRICE_ADJUST_FIELDS = [
+    'open', 'high', 'low', 'close', 'last', 'limit_up', 'limit_down', 'settlement', 'prev_settlement', 'prev_close',
+    'a1', 'a2', 'a3', 'a4', 'a5', 'b1', 'b2', 'b3', 'b4', 'b5'
+]
+
+
+def _futures_get_dominant_price(
+        underlying_symbols, start_date=None, end_date=None, frequency="1d", fields=None, adjust_type="pre",
+        adjust_method="prev_close_spread"
+):
+    """ 获取主力合约行情数据
+
+    :param underlying_symbols: 期货合约品种，可传入 underlying_symbol, underlying_symbol list
+    :param start_date: 开始日期, 最小日期为 20100104
+    :param end_date: 结束日期
+    :param frequency: 历史数据的频率。 支持/日/分钟/tick 级别的历史数据，默认为'1d'。
+        1m- 分钟线，1d-日线，分钟可选取不同频率，例如'5m'代表 5 分钟线
+    :param fields: 字段名称列表
+    :param adjust_type: 复权方式，不复权 - none，前复权 - pre，后复权 - post
+    :param adjust_method: 复权方法 ，prev_close_spread/open_spread:基于价差复权因子进行复权，
+        prev_close_ratio/open_ratio:基于比例复权因子进行复权，
+        默认为‘prev_close_spread',adjust_type为None 时，adjust_method 复权方法设置无效
+    :return: MultiIndex DataFrame
+
+    :example:
+
+    获取基于价差前复权计算的主力合约数据（策略当前日期是2015-01-27，则以策略当天为准，而不是已现实最新日期为准来计算复权因子）:
+
+    ..  code-block:: python3
+        :linenos:
+
+        get_dominant_price(underlying_symbols='CU', start_date='2015-01-20', end_date='2015-01-23', adjust_type="pre",
+                           adjust_method="prev_close_spread", fields=["close", "settlement"],)
+        #[Out]
+        #                               close     settlement
+        # underlying_symbol date
+        # CU                2015-01-20  40990.0     41080.0
+        #                   2015-01-21  41000.0     41060.0
+        #                   2015-01-22  41300.0     41340.0
+        #                   2015-01-23  40750.0     40950.0
+        #                   2015-01-26  39250.0     39660.0
+        #                   2015-01-27  40260.0     40210.0
+
+    """
+    env = Environment.get_instance()
+    if not isinstance(underlying_symbols, list):
+        underlying_symbols = [underlying_symbols]
+    if fields and not isinstance(fields, list):
+        fields = [fields]
+    end_date = env.trading_dt if end_date is None else pd.to_datetime(end_date)
+    start_date = end_date - datetime.timedelta(days=3) if start_date is None else pd.to_datetime(start_date)
+    if start_date > end_date:
+        raise RQInvalidArgument('in futures.get_dominant_price, start_date {} > end_date {}'.format(
+            start_date.date(), end_date.date()
+        ))
+    if end_date > pd.to_datetime(env.trading_dt):
+        raise RQInvalidArgument('in futures.get_dominant_price, end_date {} > trading day {}'.format(
+            end_date.date(), env.trading_dt.date()
+        ))
+
+    check_items_in_container([adjust_type], VALID_ADJUST_TYPES, 'adjust_type')
+    check_items_in_container([adjust_method], VALID_ADJUST_METHODS, 'adjust_method')
+
+    _date_key = 'date' if frequency == '1d' else 'trading_date'
+    _fields = fields
+    if fields and frequency != '1d' and 'trading_date' not in fields:
+        _fields = ['trading_date'] + fields
+
+    obs = [u + '88' for u in underlying_symbols]
+    df = rqdatac.get_price(
+        order_book_ids=obs, start_date=start_date, end_date=end_date, frequency=frequency, adjust_type='none',
+        fields=_fields, expect_df=True
+    )
+    if df is None:
+        return
+
+    df.reset_index(inplace=True)
+    df['underlying_symbol'] = df['order_book_id'].str[:-2]
+    df.set_index(['underlying_symbol', _date_key], inplace=True)
+    if adjust_type != 'none':
+        # 复权调整
+        factor = _get_ex_factor(underlying_symbols, adjust_type, adjust_method, pd.to_datetime(env.trading_dt.date()))
+        factor = factor.reindex(factor.index.union(df.index.unique())).groupby(level=0).ffill()
+        values = factor.loc[df.index].values
+        _fields = fields if fields else df.columns.tolist()
+        adjust_fields = [f for f in DOMINANT_PRICE_ADJUST_FIELDS if f in _fields]
+        if adjust_method.endswith('spread'):
+            for field in adjust_fields:
+                df[field] += values
+        elif adjust_method.endswith('ratio'):
+            for field in adjust_fields:
+                df[field] *= values
+        if 'total_turnover' in df.columns:
+            df['total_turnover'] = 0
+
+    if frequency != '1d':
+        df = df.reset_index().set_index(['underlying_symbol', 'datetime'])
+    df.sort_index(inplace=True)
+    del df['order_book_id']
+    return df[fields] if fields else df
+
+
+futures.get_dominant_price = staticmethod(_futures_get_dominant_price)
 futures.get_dominant = staticmethod(_futures_get_dominant)
 futures.get_member_rank = staticmethod(_futures_get_member_rank)
 futures.get_warehouse_stocks = staticmethod(_futures_get_warehouse_stocks)
@@ -1157,6 +1295,17 @@ def get_pit_financials(fields, quarter=None, interval=None, order_book_ids=None,
 @export_as_api
 @apply_rules(verify_that('statements').is_in(['all', 'latest'], ignore_none=True))
 def get_pit_financials_ex(order_book_ids, fields, count, statements='latest'):
+    # type: (Union[str, List[str]], Union[str, List[str]], int, str) -> Optional[pd.DataFrame]
+    """
+    以给定一个报告期回溯的方式获取季度基础财务数据（三大表），即利润表（income_statement），资产负债表（balance_sheet），现金流量表（cash_flow_statement)。
+
+    :param order_book_ids: 合约代码，可传入order_book_id, order_book_id list，这里输入的是A股编码
+    :param fields: 需要返回的财务字段
+    :param count: 几条数据
+    :param statements: 设置 statements 为 all 时返回所有记录，statements 等于 latest 时返回最新的一条记录，默认为 latest.
+
+    :return:
+    """
     if isinstance(order_book_ids, str):
         order_book_ids = [order_book_ids]
     env = Environment.get_instance()
@@ -1232,8 +1381,3 @@ def get_pit_financials_ex(order_book_ids, fields, count, statements='latest'):
 def query(*entities):
     return rqdatac.query(*entities)
 
-
-export_as_api(rqdatac.financials, name='financials')
-export_as_api(rqdatac.financials, name='Financials')
-export_as_api(rqdatac.fundamentals, name='fundamentals')
-export_as_api(rqdatac.Fundamentals, name='Fundamentals')

@@ -15,22 +15,27 @@
 #         在此前提下，对本软件的使用同样需要遵守 Apache 2.0 许可，Apache 2.0 许可与本许可冲突之处，以本许可为准。
 #         详细的授权流程，请联系 public@ricequant.com 获取。
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional, Dict, List
 from itertools import chain
+from typing import TYPE_CHECKING
 
 import rqalpha
-from rqalpha.core.events import EventBus
+from rqalpha.core.events import EventBus, Event, EVENT
 from rqalpha.const import INSTRUMENT_TYPE
 from rqalpha.utils.logger import system_log, user_log, user_system_log
 from rqalpha.core.global_var import GlobalVars
 from rqalpha.utils.i18n import gettext as _
+from rqalpha.const import SIDE
+if TYPE_CHECKING:
+    from rqalpha.model.order import Order
+    
 
 
 class Environment(object):
     _env = None  # type: Environment
 
-    def __init__(self, config):
+    def __init__(self, config, rqdatac_init):
         Environment._env = self
         self.config = config
         self.data_proxy = None  # type: Optional[rqalpha.data.data_proxy.DataProxy]
@@ -48,13 +53,14 @@ class Environment(object):
         self.user_system_log = user_system_log
         self.event_bus = EventBus()
         self.portfolio = None  # type: Optional[rqalpha.portfolio.Portfolio]
-        self.calendar_dt = None  # type: Optional[datetime]
-        self.trading_dt = None  # type: Optional[datetime]
+        self.calendar_dt: datetime = datetime.combine(config.base.start_date, datetime.min.time())
+        self.trading_dt: datetime = datetime.combine(config.base.start_date, datetime.min.time())
         self.mod_dict = None
         self.user_strategy = None
         self._frontend_validators = {}  # type: Dict[str, List]
         self._default_frontend_validators = []
         self._transaction_cost_decider_dict = {}
+        self.rqdatac_init = rqdatac_init # type: Boolean
 
         # Environment.event_bus used in StrategyUniverse()
         from rqalpha.core.strategy_universe import StrategyUniverse
@@ -113,9 +119,7 @@ class Environment(object):
         return chain(self._frontend_validators.get(instrument_type, []), self._default_frontend_validators)
 
     def submit_order(self, order):
-        instrument_type = self.data_proxy.instrument(order.order_book_id).type
-        account = self.portfolio.get_account(order.order_book_id)
-        if all(v.can_submit_order(order, account) for v in self._get_frontend_validators(instrument_type)):
+        if self.can_submit_order(order):
             self.broker.submit_order(order)
             return order
 
@@ -123,9 +127,24 @@ class Environment(object):
         instrument_type = self.data_proxy.instrument(order.order_book_id).type
         account = self.portfolio.get_account(order.order_book_id)
         for v in chain(self._frontend_validators.get(instrument_type, []), self._default_frontend_validators):
-            if not v.can_cancel_order(order, account):
-                return False
+            try:
+                reason = v.validate_cancellation(order, account)
+                if reason:
+                    self.order_cancellation_failed(order_book_id=order.order_book_id, reason=reason)
+                    return False
+            except NotImplementedError:
+                # 避免由于某些 mod 版本未更新，Validator method 未修改
+                if not v.can_cancel_order(order, account):
+                    return False
         return True
+    
+    def order_creation_failed(self, order_book_id, reason):
+        user_system_log.warn(reason)
+        self.event_bus.publish_event(Event(EVENT.ORDER_CREATION_REJECT, order_book_id=order_book_id, reason=reason))
+
+    def order_cancellation_failed(self, order_book_id, reason):
+        user_system_log.warn(reason)
+        self.event_bus.publish_event(Event(EVENT.ORDER_CANCELLATION_REJECT, order_book_id=order_book_id, reason=reason))
 
     def get_universe(self):
         return self._universe.get()
@@ -166,6 +185,10 @@ class Environment(object):
 
     def get_trade_tax(self, trade):
         return self._get_transaction_cost_decider(trade.order_book_id).get_trade_tax(trade)
+    
+    def get_transaction_cost_with_value(self, value: float) -> float:
+        side = SIDE.BUY if value >= 0 else SIDE.SELL
+        return self._transaction_cost_decider_dict[INSTRUMENT_TYPE.CS].get_transaction_cost_with_value(abs(value), side)
 
     def get_trade_commission(self, trade):
         return self._get_transaction_cost_decider(trade.order_book_id).get_trade_commission(trade)
@@ -178,11 +201,18 @@ class Environment(object):
         self.calendar_dt = calendar_dt
         self.trading_dt = trading_dt
 
-    def can_submit_order(self, order):
+    def can_submit_order(self, order: 'Order') -> bool:
         # forward compatible
         instrument_type = self.data_proxy.instrument(order.order_book_id).type
         account = self.portfolio.get_account(order.order_book_id)
         for v in self._get_frontend_validators(instrument_type):
-            if not v.can_submit_order(order, account):
-                return False
+            try:
+                reason = v.validate_submission(order, account)
+                if reason:
+                    self.order_creation_failed(order_book_id=order.order_book_id, reason=reason)
+                    return False
+            except NotImplementedError:
+                # 避免由于某些 mod 版本未更新，Validator method 未修改
+                if not v.can_submit_order(order, account):
+                    return False
         return True

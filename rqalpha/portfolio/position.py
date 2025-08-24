@@ -15,9 +15,10 @@
 #         在此前提下，对本软件的使用同样需要遵守 Apache 2.0 许可，Apache 2.0 许可与本许可冲突之处，以本许可为准。
 #         详细的授权流程，请联系 public@ricequant.com 获取。
 
-from collections import UserDict
+from collections import UserDict, deque
 from datetime import date
-from typing import Dict, Iterable, Tuple, Optional
+from decimal import Decimal
+from typing import Dict, Iterable, Tuple, Optional, Deque, List
 
 from rqalpha.const import POSITION_DIRECTION, POSITION_EFFECT
 from rqalpha.environment import Environment
@@ -28,6 +29,7 @@ from rqalpha.model.trade import Trade
 from rqalpha.utils import is_valid_price
 from rqalpha.utils.i18n import gettext as _
 from rqalpha.utils.repr import PropertyReprMeta, property_repr
+from rqalpha.utils.logger import user_system_log
 
 
 def new_position_meta():
@@ -90,6 +92,10 @@ class Position(AbstractPosition, metaclass=PositionMeta):
 
         self._direction_factor = 1 if direction == POSITION_DIRECTION.LONG else -1
 
+        self._queue = PositionQueue()
+        if init_quantity:
+            self._queue.handle_trade(init_quantity, self._env.trading_dt.date())
+
     @property
     def order_book_id(self):
         # type: () -> str
@@ -124,7 +130,10 @@ class Position(AbstractPosition, metaclass=PositionMeta):
     @property
     def position_pnl(self):
         # type: () -> float
-        return self._logical_old_quantity * (self.last_price - self.prev_close) * self._direction_factor
+        if self._logical_old_quantity:
+            return self._logical_old_quantity * (self.last_price - self.prev_close) * self._direction_factor
+        else:
+            return 0
 
     @property
     def pnl(self):
@@ -146,18 +155,20 @@ class Position(AbstractPosition, metaclass=PositionMeta):
 
     @property
     def prev_close(self):
+        # type: () -> float
         if not is_valid_price(self._prev_close):
             self._prev_close = self._env.data_proxy.get_prev_close(self._order_book_id, self._env.trading_dt)
+            if not is_valid_price(self._prev_close):
+                user_system_log.warn("invalid prev close of {}: {}".format(self._order_book_id, self._prev_close))
         return self._prev_close
 
     @property
     def last_price(self):
-        if not self._last_price:
+        # type: () -> float
+        if not is_valid_price(self._last_price):
             self._last_price = self._env.data_proxy.get_last_price(self._order_book_id)
             if not is_valid_price(self._last_price):
-                raise RuntimeError(_("invalid price of {order_book_id}: {price}").format(
-                    order_book_id=self._order_book_id, price=self._last_price
-                ))
+                user_system_log.warn("invalid last price of {}: {}".format(self._order_book_id, self._last_price))
         return self._last_price
 
     @property
@@ -187,7 +198,8 @@ class Position(AbstractPosition, metaclass=PositionMeta):
             "avg_price": self._avg_price,
             "trade_cost": self._trade_cost,
             "transaction_cost": self._transaction_cost,
-            "prev_close": self._prev_close
+            "prev_close": self._prev_close,
+            "position_queue": list(self._queue.queue)
         }
 
     def set_state(self, state):
@@ -203,6 +215,7 @@ class Position(AbstractPosition, metaclass=PositionMeta):
         self._trade_cost = state.get("trade_cost", 0)
         self._transaction_cost = state.get("transaction_cost", 0)
         self._prev_close = state.get("prev_close")
+        self._queue.set_sate(state.get("position_queue", []))
 
     def before_trading(self, trading_date):
         # type: (date) -> float
@@ -219,6 +232,7 @@ class Position(AbstractPosition, metaclass=PositionMeta):
         # 返回总资金的变化量
         self._transaction_cost += trade.transaction_cost
         if trade.position_effect == POSITION_EFFECT.OPEN:
+            self._queue.handle_trade(trade.last_quantity, self._env.trading_dt.date())
             if self._quantity < 0:
                 self._avg_price = trade.last_price if self._quantity + trade.last_quantity > 0 else 0
             else:
@@ -229,6 +243,7 @@ class Position(AbstractPosition, metaclass=PositionMeta):
             return (-1 * trade.last_price * trade.last_quantity) - trade.transaction_cost
         elif trade.position_effect == POSITION_EFFECT.CLOSE:
             # 先平昨，后平今
+            self._queue.handle_trade(-trade.last_quantity, self._env.trading_dt.date())
             self._old_quantity -= min(trade.last_quantity, self._old_quantity)
             self._quantity -= trade.last_quantity
             self._trade_cost -= trade.last_price * trade.last_quantity
@@ -246,8 +261,17 @@ class Position(AbstractPosition, metaclass=PositionMeta):
     def update_last_price(self, price):
         self._last_price = price
 
-    def calc_close_today_amount(self, trade_amount):
+    def calc_close_today_amount(self, trade_amount, position_effect):
         return 0
+
+    @property
+    def position_queue(self):
+        # type: () -> deque[tuple[date, int]]
+        """
+        获取持仓队列，返回每笔持仓的开仓时间和数量
+        格式为 [(开仓日期, 持仓数量), ...]
+        """
+        return self._queue.queue
 
     @property
     def _open_orders(self):
@@ -255,6 +279,69 @@ class Position(AbstractPosition, metaclass=PositionMeta):
         for order in self._env.broker.get_open_orders(self.order_book_id):
             if order.position_direction == self._direction:
                 yield order
+
+
+class PositionQueue:
+    def __init__(self):
+        self._queue: Deque[Tuple[date, int]] = deque()
+
+    def set_sate(self, state: List[Tuple[date, int]]):
+        self._queue = deque(state)
+
+    def handle_trade(self, delta_quantity, trading_date: date, close_today: bool = False):
+        if delta_quantity == 0:
+            return
+        if self._queue and self._queue[0][1] * delta_quantity < 0:
+            # 从正平仓到负或者从负平仓到正
+            if close_today:
+                # 强制先平今
+                d, qty_in_queue = self._queue[-1]
+                if d >= trading_date:
+                    if abs(qty_in_queue) <= abs(delta_quantity):
+                        delta_quantity += qty_in_queue
+                        self._queue.pop()
+                    else:
+                        self._queue[-1] = (d, qty_in_queue + delta_quantity)
+                        delta_quantity = 0
+            while delta_quantity and self._queue:
+                d, qty_in_queue = self._queue[0]
+                if abs(qty_in_queue) <= abs(delta_quantity):
+                    # 当前持仓批次全部平掉
+                    delta_quantity += qty_in_queue
+                    self._queue.popleft()
+                else:
+                    # 当前持仓批次部分平掉
+                    self._queue[0] = (d, qty_in_queue + delta_quantity)
+                    delta_quantity = 0
+            if delta_quantity != 0:
+                # queue 消耗光了，delta_quantity 还没消耗完
+                self._queue.append((trading_date, delta_quantity))
+        else:
+            # 开仓
+            if self._queue and self._queue[-1][0] == trading_date:
+                # 当日已有开仓，更新数量
+                _, quantity = self._queue.pop()
+                self._queue.append((trading_date, quantity + delta_quantity))
+            else:
+                # 当日首次开仓
+                self._queue.append((trading_date, delta_quantity))
+
+    def handle_split(self, ratio: Decimal, expected_quantity):
+        self._queue = deque(
+            (d, round(Decimal(q) * ratio)) for d, q in self._queue
+        )
+        diff = expected_quantity - sum(q for _, q in self._queue)
+        if diff != 0:
+            # 有可能因为 round 的原因导致差1股
+            self._queue[-1] = (self._queue[-1][0], self._queue[-1][1] + diff)
+
+
+    def clear(self):
+        self._queue.clear()
+
+    @property
+    def queue(self):
+        return self._queue.copy()
 
 
 class PositionProxy(metaclass=PositionProxyMeta):

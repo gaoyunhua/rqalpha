@@ -1,6 +1,7 @@
 import os
 import pickle
 from contextlib import contextmanager
+from datetime import date
 
 import six
 
@@ -18,7 +19,11 @@ class RQAlphaFixture(object):
 class EnvironmentFixture(RQAlphaFixture):
     def __init__(self, *args, **kwargs):
         super(EnvironmentFixture, self).__init__(*args, **kwargs)
-        self.env_config = {}
+        self.env_config = {
+            "base":{
+                "start_date": date(2016, 1, 1)
+            }
+        }
         self.env = None
 
     def init_fixture(self):
@@ -26,7 +31,7 @@ class EnvironmentFixture(RQAlphaFixture):
         from rqalpha.environment import Environment
 
         super(EnvironmentFixture, self).init_fixture()
-        self.env = Environment(RqAttrDict(self.env_config))
+        self.env = Environment(RqAttrDict(self.env_config), False)
 
     @contextmanager
     def mock_env_method(self, name, mock_method):
@@ -72,7 +77,8 @@ class BaseDataSourceFixture(TempDirFixture, EnvironmentFixture):
 
         self.env_config = {
             "base": {
-                "accounts": {"STOCK": 100}
+                "accounts": {"STOCK": 100},
+                "start_date": date(2016, 1, 1),
             }
         }
 

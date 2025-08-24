@@ -16,22 +16,24 @@
 #         详细的授权流程，请联系 public@ricequant.com 获取。
 
 from datetime import datetime, date
-from typing import Union, List, Sequence, Optional
+from typing import Union, List, Sequence, Optional, Tuple
 
 import six
 import numpy as np
 import pandas as pd
 
-from rqalpha.const import INSTRUMENT_TYPE, TRADING_CALENDAR_TYPE
+from rqalpha.const import INSTRUMENT_TYPE, TRADING_CALENDAR_TYPE, EXECUTION_PHASE
 from rqalpha.utils import risk_free_helper, TimeRange, merge_trading_period
 from rqalpha.data.trading_dates_mixin import TradingDatesMixin
 from rqalpha.model.bar import BarObject, NANDict, PartialBarObject
 from rqalpha.model.tick import TickObject
 from rqalpha.model.instrument import Instrument
+from rqalpha.model.order import ALGO_ORDER_STYLES
 from rqalpha.utils.functools import lru_cache
 from rqalpha.utils.datetime_func import convert_int_to_datetime, convert_date_to_int
 from rqalpha.utils.typing import DateLike, StrOrIter
 from rqalpha.interface import AbstractDataSource, AbstractPriceBoard
+from rqalpha.core.execution_context import ExecutionContext
 
 
 class DataProxy(TradingDatesMixin):
@@ -60,13 +62,19 @@ class DataProxy(TradingDatesMixin):
         return self._data_source.get_yield_curve(start_date, end_date, tenor)
 
     def get_risk_free_rate(self, start_date, end_date):
-        tenor = risk_free_helper.get_tenor_for(start_date, end_date)
+        tenors = risk_free_helper.get_tenors_for(start_date, end_date)
         # 为何取 start_date 当日的？表示 start_date 时借入资金、end_date 归还的成本
-        yc = self._data_source.get_yield_curve(start_date, start_date, [tenor])
+        _s = start_date if self.is_trading_date(start_date) else self.get_next_trading_date(start_date, n=1)
+        yc = self._data_source.get_yield_curve(_s, _s)
         if yc is None or yc.empty:
-            return 0
-        rate = yc.values[0, 0]
-        return 0 if np.isnan(rate) else rate
+            return np.nan
+        yc = yc.iloc[0]
+        for tenor in tenors[::-1]:
+            rate = yc.get(tenor)
+            if rate and not np.isnan(rate):
+                return rate
+        else:
+            return np.nan
 
     def get_dividend(self, order_book_id):
         instrument = self.instruments(order_book_id)
@@ -124,9 +132,9 @@ class DataProxy(TradingDatesMixin):
 
     @lru_cache(10240)
     def _get_prev_settlement(self, instrument, dt):
-        prev_trading_date = self.get_previous_trading_date(dt)
-        bar = self._data_source.history_bars(instrument, 1, '1d', 'settlement', prev_trading_date,
-                                             skip_suspended=False, adjust_orig=dt)
+        bar = self._data_source.history_bars(
+            instrument, 1, '1d', fields='prev_settlement', dt=dt, skip_suspended=False, adjust_orig=dt
+        )
         if bar is None or len(bar) == 0:
             return np.nan
         return bar[0]
@@ -177,6 +185,11 @@ class DataProxy(TradingDatesMixin):
                 "datetime", "open", "limit_up", "limit_down", "volume", "total_turnover"
             ]}
         return PartialBarObject(instrument, bar)
+    
+    def get_open_auction_volume(self, order_book_id, dt):
+        instrument = self.instruments(order_book_id)
+        volume = self._data_source.get_open_auction_volume(instrument, dt)
+        return volume
 
     def history(self, order_book_id, bar_count, frequency, field, dt):
         data = self.history_bars(order_book_id, bar_count, frequency,
@@ -212,7 +225,7 @@ class DataProxy(TradingDatesMixin):
             ]
             _FUTURE_FIELD_NAMES = _STOCK_FIELD_NAMES + ['open_interest', 'prev_settlement']
 
-            if ins.type == 'Future':
+            if ins.type not in [INSTRUMENT_TYPE.FUTURE, INSTRUMENT_TYPE.OPTION]:
                 return _STOCK_FIELD_NAMES
             else:
                 return _FUTURE_FIELD_NAMES
@@ -223,7 +236,7 @@ class DataProxy(TradingDatesMixin):
             if not bar:
                 return None
             d = {k: bar[k] for k in tick_fields_for(instrument) if k in bar.dtype.names}
-            d['last'] = bar['close']
+            d["last"] = bar["open"] if ExecutionContext.phase() == EXECUTION_PHASE.OPEN_AUCTION else bar["close"]
             d['prev_close'] = self._get_prev_close(order_book_id, dt)
             return TickObject(instrument, d)
 
@@ -232,9 +245,10 @@ class DataProxy(TradingDatesMixin):
     def available_data_range(self, frequency):
         return self._data_source.available_data_range(frequency)
 
-    def get_commission_info(self, order_book_id):
+    def get_futures_trading_parameters(self, order_book_id, dt):
+        # type: (str, datetime.date) -> FuturesTradingParameters
         instrument = self.instruments(order_book_id)
-        return self._data_source.get_commission_info(instrument)
+        return self._data_source.get_futures_trading_parameters(instrument, dt)
 
     def get_merge_ticks(self, order_book_id_list, trading_date, last_dt=None):
         return self._data_source.get_merge_ticks(order_book_id_list, trading_date, last_dt)
@@ -297,3 +311,18 @@ class DataProxy(TradingDatesMixin):
     def is_night_trading(self, sym_or_ids):
         # type: (StrOrIter) -> bool
         return any((instrument.trade_at_night for instrument in self.instruments(sym_or_ids)))
+
+    def get_algo_bar(self, id_or_ins, order_style, dt):
+        # type: (Union[str, Instrument], Union[*ALGO_ORDER_STYLES], datetime) -> Tuple[float, int]
+        if not isinstance(order_style, ALGO_ORDER_STYLES):
+            raise RuntimeError("get_algo_bar only support VWAPOrder and TWAPOrder")
+        if not isinstance(id_or_ins, Instrument):
+            id_or_ins = self.instrument(id_or_ins)
+        if id_or_ins is None:
+            return np.nan, 0
+        # 存在一些有日线没分钟线的情况,如果不是缺了,通常都是因为volume为0,用日线先判断确认下
+        day_bar = self.get_bar(order_book_id=id_or_ins.order_book_id, dt=dt, frequency="1d")
+        if day_bar.volume == 0:
+            return np.nan, 0
+        bar = self._data_source.get_algo_bar(id_or_ins, order_style.start_min, order_style.end_min, dt)
+        return (bar[order_style.TYPE], bar["volume"]) if bar else (np.nan, 0)

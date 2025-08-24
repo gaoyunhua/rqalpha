@@ -50,14 +50,16 @@ class ProgressedProcessPoolExecutor(ProcessPoolExecutor):
     def _adjust_process_count(self):
         # noinspection PyUnresolvedReferences
         for _ in range(len(self._processes), self._max_workers):
-            # noinspection PyUnresolvedReferences
-            p = multiprocessing.Process(
-                target=_process_worker,
-                args=(self._call_queue, self._result_queue, self._progress_queue, self._initializer, self._initargs)
-            )
-            p.start()
-            # noinspection PyUnresolvedReferences
-            self._processes[p.pid] = p
+            self._spawn_process()
+
+    def _spawn_process(self):
+        p = multiprocessing.Process(
+            target=_process_worker,
+            args=(self._call_queue, self._result_queue, self._progress_queue, self._initializer, self._initargs)
+        )
+        p.start()
+        # noinspection PyUnresolvedReferences
+        self._processes[p.pid] = p
 
     def submit(self, fn, *args, **kwargs):
         if isinstance(fn, ProgressedTask):
@@ -73,18 +75,22 @@ class ProgressedProcessPoolExecutor(ProcessPoolExecutor):
         if not wait:
             return super(ProgressedProcessPoolExecutor, self).shutdown(wait)
         progress_bar = click.progressbar(length=self._total_steps, show_eta=False)
+        finish = False
         while True:
-            try:
-                step = self._progress_queue.get(timeout=0.5)
-            except queue.Empty:
-                pass
-            else:
-                progress_bar.update(step)
-
             for fut in self._futures:
                 if fut.running():
                     break
             else:
+                finish = True
+            while True:
+                try:
+                    step = self._progress_queue.get(timeout=0.5)
+                except queue.Empty:
+                    break
+                else:
+                    progress_bar.update(step)
+
+            if finish:
                 break
 
         progress_bar.render_finish()
